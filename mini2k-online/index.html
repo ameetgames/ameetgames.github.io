@@ -156,12 +156,12 @@
 
 <div class="overlay" id="pause" hidden>
   <div class="card">
-    <h1>Paused</h1>
-    <p class="sub">Press <kbd>P</kbd> or <kbd>Esc</kbd> to resume.</p>
+    <h1 id="pauseTitle">Paused</h1>
+    <p class="sub" id="pauseSub">Press <kbd>P</kbd> or <kbd>Esc</kbd> to resume.</p>
     <p id="pauseOnline" hidden>Online game: play keeps going while this menu is open. Subs and timeouts are sent to the game and happen at the next dead ball, on both screens. <button class="ghost" id="btnPauseBoth">Pause both screens</button></p>
     <div id="coach" hidden>
       <h2>Coach</h2>
-      <div class="actions left"><button id="btnTimeout">Call timeout</button><span class="note" id="timeoutNote"></span></div>
+      <div class="actions left" id="timeoutRow"><button id="btnTimeout">Call timeout</button><span class="note" id="timeoutNote"></span></div>
       <table id="subTable"></table>
       <label class="auto"><input type="checkbox" id="autoSubs"> Auto substitutions (the CPU coach manages your bench)</label>
       <p class="note" id="subNote">Pick a bench player next to anyone on the floor. The change happens at the next dead ball.</p>
@@ -188,7 +188,7 @@
     <p class="sub">One of you creates a room, the other joins with its code. Each of you controls only your own team. The one who creates the room is the home team.</p>
     <div class="picks">
       <label for="onTeam">Your team<select id="onTeam"></select></label>
-      <label for="onVia">Connect through<select id="onVia"><option value="ntfy">Internet: room code</option><option value="manual">Manual codes: copy and paste</option><option value="local">This computer: two tabs (test)</option></select></label>
+      <label for="onVia">Connect through<select id="onVia"><option value="server" hidden>Internet: room code (Mini2K server)</option><option value="ntfy" selected>Internet: room code (ntfy.sh)</option><option value="manual">Manual codes: copy and paste</option><option value="local">This computer: two tabs (test)</option></select></label>
       <label for="onQ">Quarter length (room creator picks)<select id="onQ"><option value="5">5 minutes</option><option value="6">6 minutes</option><option value="8">8 minutes</option><option value="12" selected>12 minutes</option></select></label>
       <label for="onDiff">Meter difficulty (room creator picks)<select id="onDiff"><option value="rookie">Rookie</option><option value="pro" selected>Pro</option><option value="allstar">All-Star</option></select></label>
     </div>
@@ -211,7 +211,10 @@
     <div class="actions"><button id="btnOnStart" hidden disabled>Tip Off Now</button><button class="ghost" id="btnOnLeave">Back</button><button class="ghost btnFull">Fullscreen</button></div>
     <details>
       <summary>Network settings (for school or work wifi)</summary>
-      <p>Most home connections link the two computers directly. School and office wifi often blocks that; then the game needs a relay (a TURN server) that both computers can reach. A free Metered account gives 20 GB a month, which is hundreds of games (one game uses roughly 30 to 60 MB). Only the person who creates the room needs to fill this in; the friend who joins gets it automatically.</p>
+      <p>Most home connections link the two computers directly. School and office wifi often blocks that. Your own Mini2K server fixes it: it finds the room, and when nothing direct works it carries the game itself over normal web traffic. If you opened the game from the server's address you don't need to type anything here.</p>
+      <label>Mini2K server address<input type="text" id="netServer" placeholder="https://mini2k-relay.onrender.com" autocomplete="off" spellcheck="false"></label>
+      <div class="actions left"><span id="netServerState"></span></div>
+      <p>Optional, a TURN relay (used before the server, if set). A free Metered account gives 20 GB a month. Only the person who creates the room needs to fill this in.</p>
       <label>Metered credentials link<input type="text" id="netMetered" placeholder="https://yourapp.metered.live/api/v1/turn/credentials?apiKey=..."></label>
       <p>Or any other TURN server:</p>
       <label>TURN address<input type="text" id="netTurn" placeholder="turns:relay.example.com:443?transport=tcp"></label>
@@ -1911,6 +1914,8 @@ const SCORE_HARD = 0.85 * 0.75;
 const DUNK_HARD = 0.8 * 0.75, DUNK_CONTEST = 0.31;
 /** Space held for less than this is a pump fake, not a shot. */
 export const TAP_FAKE = 0.14;
+/** A timeout lasts this long (seconds); both coaches make substitutions during it, in when it ends. */
+export const TIMEOUT_SECS = 10;
 /** Usual offense/defense ratio of the positional rebound factors (keeps the offensive-rebound rate calibrated). */
 const REB_NORM = 0.66;
 /**
@@ -3069,7 +3074,7 @@ export class LiveGame {
           if (!ev.steal) q.push({ k: 'wait', dur: 1.1, banner: describe(ev, this.data.byId).replace(/^.*turnover: /, '').replace(/^./, (c) => c.toUpperCase()) });
           break;
         case 'sub': q.push({ k: 'sub', ev, dur: 0.02 }); break;
-        case 'timeout': q.push({ k: 'timeout', ev, dur: 4.0, banner: `Timeout ${this.state.teams[ev.team].id} (${ev.left} left)` }); break;
+        case 'timeout': q.push({ k: 'timeout', ev, dur: TIMEOUT_SECS, banner: `Timeout ${this.state.teams[ev.team].id} (${ev.left} left)` }); break;
       }
     }
     // Free throws: everybody walks to the lane first (clock stopped), then one step per attempt.
@@ -8012,13 +8017,17 @@ export { NO_INPUT };
 // peer connection itself, and a message channel that can carry big messages (snapshots).
 //
 // Signaling only has to pass two short messages (offer and answer), so it can go through:
+//   'server' your own Mini2K relay server (relay/server.js): a WebSocket room named after the room
+//            code. Default when a server is known (the page was opened from it, or its address is in
+//            Network settings). It goes over normal HTTPS, which school wifi lets through.
 //   'ntfy'   ntfy.sh, a free public message relay (no account): both screens subscribe to a topic
-//            named after the room code. Default.
+//            named after the room code.
 //   'local'  BroadcastChannel: two tabs of the same browser on one computer (for testing).
 //   'manual' no server at all: copy a code from one screen and paste it on the other, both ways.
 // ICE candidates are gathered before the offer/answer is sent (no trickle), so each side sends one
 // message. STUN finds the direct route; a TURN relay (set up in Network settings) is the fallback
-// when school or office wifi blocks direct connections.
+// when school or office wifi blocks direct connections. Last resort: the Mini2K server carries the
+// game itself over its WebSocket (ServerLink), which works wherever web pages work.
 
 export const STUN = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
 const NTFY = 'https://ntfy.sh';
@@ -8069,7 +8078,101 @@ class NtfySignal extends Signal {
   close() { this.es?.close(); }
 }
 
-export function makeSignal(kind, code, me) {
+// ------------------------------------------------------------------ own relay server
+
+/** The Mini2K server's address: typed in Network settings, or the site this page was opened from. */
+export function serverBase(typed) {
+  let u = String(typed ?? '').trim();
+  // opened from a web address: the relay server may be serving this page (checked with /health)
+  if (!u && typeof location !== 'undefined' && /^https?:$/.test(location.protocol) && location.hostname) u = location.origin;
+  if (!u) return '';
+  if (!/^[a-z]+:\/\//i.test(u)) u = 'https://' + u;
+  return u.replace(/^ws(s?):/i, 'http$1:').replace(/\/+$/, '');
+}
+const wsUrl = (base, room) => base.replace(/^http/i, 'ws') + '/ws?room=' + encodeURIComponent(room);
+
+/** Free hosting puts the server to sleep when nobody uses it; the first visit wakes it (up to a minute). */
+export async function wakeServer(base, ms = 75000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    try {
+      const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20000);
+      const r = await fetch(base + '/health', { cache: 'no-store', signal: ctl.signal });
+      clearTimeout(t);
+      if (r.ok && (await r.text()).startsWith('ok')) return true;
+    } catch { /* asleep or unreachable: try again */ }
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+  return false;
+}
+
+function openWs(base, room, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    let ws;
+    try { ws = new WebSocket(wsUrl(base, room)); } catch { reject(new Error('That Mini2K server address is not valid.')); return; }
+    const fail = setTimeout(() => { ws.close(); reject(new Error('Could not reach the Mini2K server. It may still be waking up: try again in a minute.')); }, timeout);
+    ws.onopen = () => { clearTimeout(fail); resolve(ws); };
+    ws.onerror = () => { clearTimeout(fail); reject(new Error('Could not reach the Mini2K server. Check its address in Network settings.')); };
+  });
+}
+
+class ServerSignal extends Signal {
+  constructor(code, me, base) { super(code, me); this.base = base; }
+  async open() {
+    if (!this.base) throw new Error('No Mini2K server address. Add it in Network settings, or pick another way to connect.');
+    this.ws = await openWs(this.base, PREFIX + this.code);
+    this.ws.onmessage = (e) => { try { const m = JSON.parse(e.data); if (m.t !== '_n') this.deliver(m); } catch { /* not ours */ } };
+    this.ws.onclose = () => { if (!this.closing) this.reopen(); };
+  }
+  /** The room connection dropped (wifi blip, server restart): come back quietly. */
+  async reopen() {
+    for (let i = 0; i < 20 && !this.closing; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try { await this.open(); return; } catch { /* keep trying */ }
+    }
+  }
+  async send(m) {
+    if (this.ws?.readyState !== 1) throw new Error('Lost the Mini2K server. Reconnecting...');
+    this.ws.send(JSON.stringify({ ...m, from: this.me }));
+  }
+  close() { this.closing = true; this.ws?.close(); }
+}
+
+/**
+ * The game through the server (when no direct or TURN route works). Same shape as Link. Each side
+ * joins a private room named by the host; the server says how many are in it, so this opens when the
+ * other side arrives and closes when it leaves.
+ */
+export class ServerLink {
+  constructor(base, pipe) {
+    this.base = base; this.pipe = pipe;
+    this.onmsg = null; this.onclose = null; this.onopen = null;
+    this.closed = false; this.isOpen = false; this.ws = null;
+  }
+  async connect() {
+    this.ws = await openWs(this.base, 'mini2k-p-' + this.pipe);
+    this.ws.onmessage = (e) => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.t === '_n') {
+        if (m.n >= 2 && !this.isOpen && !this.closed) { this.isOpen = true; this.onopen?.(); }
+        else if (m.n < 2 && this.isOpen) this.fireClose('closed');
+        return;
+      }
+      this.onmsg?.(m);
+    };
+    this.ws.onclose = () => this.fireClose('closed');
+    return this;
+  }
+  get open() { return this.isOpen && !this.closed && this.ws?.readyState === 1; }
+  fireClose(why) { if (this.closed) return; this.closed = true; this.isOpen = false; try { this.ws?.close(); } catch { /* gone */ } this.onclose?.(why); }
+  send(m) { if (!this.open) return false; this.ws.send(JSON.stringify(m)); return true; }
+  async route() { return 'server'; }
+  close() { this.fireClose('closed'); }
+}
+export const newPipeId = () => [...crypto.getRandomValues(new Uint8Array(12))].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+export function makeSignal(kind, code, me, base = '') {
+  if (kind === 'server') return new ServerSignal(code, me, base);
   if (kind === 'local') return new LocalSignal(code, me);
   if (kind === 'ntfy') return new NtfySignal(code, me);
   throw new Error(`unknown signaling ${kind}`);
@@ -8268,7 +8371,7 @@ import { Sound } from '@@render/audio.js@@';
 import { SW, SH } from '@@render/view.js@@';
 import { loadPixelFonts } from '@@ui/pixelfont.js@@';
 import { Session, makeOnlineGame } from '@@net/session.js@@';
-import { makeSignal, newRoomCode, cleanCode, iceServers, hostOffer, guestAnswer, packCode, unpackCode, mergeIce, hasTurn, relayCount } from '@@net/peer.js@@';
+import { makeSignal, newRoomCode, cleanCode, iceServers, hostOffer, guestAnswer, packCode, unpackCode, mergeIce, hasTurn, relayCount, serverBase, wakeServer, ServerLink, newPipeId } from '@@net/peer.js@@';
 
 loadPixelFonts();
 if (window.__MINI2K_DATA) document.querySelector('.head a')?.remove();   // the one-file build has no roster page
@@ -8398,7 +8501,7 @@ $('btnDemo').addEventListener('click', () => start({
 function setPaused(v) {
   if (!live || live.phase === 'final' || !$('menu').hidden || !$('online').hidden) return;
   paused = v;                  // online: only opens the menu, the game keeps running
-  if (v) renderCoach();
+  if (v) { toPanel = null; pauseMode(false); renderCoach(); }
   $('pause').hidden = !v;
   if (!net) last = performance.now();
 }
@@ -8446,7 +8549,8 @@ function renderCoach() {
     return `<tr class="team"><th></th><th>${data.teams[T.id]?.name ?? T.id}</th><th>PTS</th><th>REB</th><th>AST</th><th>BLK</th><th>STL</th></tr>${rowsS}`;
   }).join('');
   const n = live.pendingSubs.length;
-  $('subNote').textContent = n ? `${n} substitution${n > 1 ? 's' : ''} will be made at the next dead ball.`
+  const atEnd = toPanel ? 'when the timeout ends' : 'at the next dead ball';
+  $('subNote').textContent = n ? `${n} substitution${n > 1 ? 's' : ''} will be made ${atEnd}.`
     : 'Pick a bench player next to anyone on the floor. The change happens at the next dead ball.';
 }
 // Online, requests go through the game (both screens apply them at the same step); offline, straight in.
@@ -8467,7 +8571,32 @@ $('btnTimeout').addEventListener('click', () => {
   if (net) { net.command({ k: 'to' }); $('timeoutNote').textContent = 'Sent.'; return; }
   live.wantTimeout = true; renderCoach();
 });
-// keep the coach menu current while it is open online (requests confirmed by the game show up)
+// ---------- timeout: the coach menu opens by itself and the subs go in when the timeout ends ----------
+let toPanel = null;          // { st } while the timeout screen is open
+function pauseMode(timeout) {
+  $('timeoutRow').style.display = timeout ? 'none' : '';   // no new timeout from inside a timeout
+  $('btnResume').textContent = timeout ? 'Back to the game' : 'Resume';
+  if (!timeout) { $('pauseTitle').textContent = 'Paused'; $('pauseSub').innerHTML = 'Press <kbd>P</kbd> or <kbd>Esc</kbd> to resume.'; }
+}
+function timeoutPanel() {
+  const q = live?.phase === 'anim' ? live.queue[0] : null;
+  const st = q?.started && q.k === 'timeout' && live.user ? q : null;
+  if (st && !paused && $('menu').hidden && $('online').hidden) {
+    if (!toPanel || toPanel.st !== st) {
+      toPanel = { st, closed: false };
+      pauseMode(true); renderCoach(); $('pause').hidden = false;
+    }
+    if (toPanel.closed) return;
+    const who = live.state.teams[st.ev.team].id, left = Math.max(0, Math.ceil(st.dur - st.t));
+    $('pauseTitle').textContent = `Timeout ${who} · ${left}`;
+    $('pauseSub').textContent = 'Make your substitutions now. They go in when the timeout ends.';
+  } else if (toPanel) {
+    if (!paused) { $('pause').hidden = true; canvas.focus?.(); }
+    pauseMode(false); toPanel = null;
+  }
+}
+// keep the coach menu current while it is open online or in a timeout (requests confirmed by the game show up)
+setInterval(() => { if (live && toPanel && !toPanel.closed && !document.activeElement?.closest?.('#subTable')) renderCoach(); }, 600);
 setInterval(() => { if (net && live && paused && !$('pause').hidden && !document.activeElement?.closest?.('#subTable')) renderCoach(); }, 600);
 window.addEventListener('keydown', (e) => {
   if (e.code !== 'KeyH' || e.repeat || !live || (e.target instanceof HTMLElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName))) return;
@@ -8490,7 +8619,10 @@ const bindSetting = (cls, key, parse = (v) => v) => {
 bindSetting('setView', 'view'); bindSetting('setScale', 'scale', (v) => (v === 'auto' ? 'auto' : Number(v)));
 bindSetting('setZoom', 'gameZoom', Number); bindSetting('setCrowd', 'crowd'); bindSetting('setAudio', 'audio');
 bindSetting('setVolume', 'volume', Number); bindSetting('setHints', 'hints'); bindSetting('setFps', 'fps');
-$('btnResume').addEventListener('click', () => setPaused(false));
+$('btnResume').addEventListener('click', () => {
+  if (toPanel && !paused) { toPanel.closed = true; $('pause').hidden = true; pauseMode(false); canvas.focus?.(); return; }   // timeout screen: just close it
+  setPaused(false);
+});
 $('btnQuit').addEventListener('click', () => { live = null; paused = false; $('pause').hidden = true; leaveOnline(); $('menu').hidden = false; });
 $('btnAgain').addEventListener('click', () => {
   live = null; $('final').hidden = true;
@@ -8543,6 +8675,7 @@ function frame(now) {
     const frozen = net ? net.paused : paused;
     if (settings.view === 'classic') render(ctx, live);
     else broadcast.frame(frozen ? 0 : dt, { intro: intro ? Math.max(0.001, intro.t / 2.2) : 0, alpha: frozen || intro ? 1 : alpha ?? Math.min(1, acc / STEP), fps });
+    timeoutPanel();
     if (live.phase === 'final' && !finalShown && (live.phaseT ?? 9) >= 0) { finalT += dt; if (finalT > 2.5) showFinal(); }
   } else {
     ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -8575,9 +8708,10 @@ let netCfg = {};
 try { netCfg = JSON.parse(localStorage.getItem('mini2k.net') ?? '{}'); } catch { /* private mode */ }
 $('netMetered').value = netCfg.meteredUrl ?? ''; $('netTurn').value = netCfg.turnUrl ?? '';
 $('netUser').value = netCfg.turnUser ?? ''; $('netPass').value = netCfg.turnPass ?? '';
+$('netServer').value = netCfg.serverUrl ?? '';
 /** The relay settings as typed right now (no need to press Save first), remembered for next time. */
 function readNet() {
-  netCfg = { meteredUrl: $('netMetered').value.trim(), turnUrl: $('netTurn').value.trim(), turnUser: $('netUser').value.trim(), turnPass: $('netPass').value };
+  netCfg = { serverUrl: $('netServer').value.trim(), meteredUrl: $('netMetered').value.trim(), turnUrl: $('netTurn').value.trim(), turnUser: $('netUser').value.trim(), turnPass: $('netPass').value };
   try { localStorage.setItem('mini2k.net', JSON.stringify(netCfg)); } catch { /* ignore */ }
   return netCfg;
 }
@@ -8587,6 +8721,35 @@ $('btnNetSave').addEventListener('click', () => {
   setTimeout(() => { $('netSaved').textContent = ''; }, 1500);
 });
 for (const id of ['netMetered', 'netTurn', 'netUser', 'netPass']) $(id).addEventListener('change', readNet);
+$('netServer').addEventListener('change', () => { readNet(); checkServer(); });
+
+// ---------- own relay server: found = { base, ok }. Checked when the online screen opens.
+let srv = { base: '', ok: false, checking: null };
+/** Address of a working Mini2K server, or '' (then the game uses ntfy.sh / manual codes and TURN only). */
+const srvBase = () => (srv.ok ? srv.base : '');
+function checkServer() {
+  const base = serverBase(netCfg.serverUrl);
+  const typed = !!(netCfg.serverUrl ?? '').trim();
+  srv = { base, ok: false, checking: null };
+  const opt = $('onVia').querySelector('option[value="server"]');
+  if (!base) { opt.hidden = true; if ($('onVia').value === 'server') $('onVia').value = 'ntfy'; $('netServerState').textContent = ''; return Promise.resolve(false); }
+  opt.hidden = false;
+  $('netServerState').textContent = 'Checking...';
+  if (typed && !$('online').hidden) onStatus('Waking up the Mini2K server (free hosting sleeps when nobody plays; this can take up to a minute)...');
+  const S = srv;
+  // a typed address may be asleep (wait for it); the page's own site answers at once or is not a server
+  S.checking = wakeServer(base, typed ? 75000 : 4000).then((ok) => {
+    if (srv !== S) return ok;
+    S.ok = ok; S.done = true;
+    $('netServerState').textContent = ok ? 'Server OK' : typed ? 'Server not answering' : '';
+    if (!ok) { opt.hidden = !typed; if ($('onVia').value === 'server' && !typed) $('onVia').value = 'ntfy'; }
+    else if (!lobby) $('onVia').value = 'server';
+    if (!$('online').hidden && !lobby) onStatus(ok ? '' : typed ? 'The Mini2K server is not answering. Check its address in Network settings.' : '', !ok && typed);
+    return ok;
+  });
+  return S.checking;
+}
+checkServer();
 /** ICE servers from the settings; says so on screen if the relay settings have a problem. */
 async function myIce() {
   const ice = await iceServers(readNet());
@@ -8619,7 +8782,7 @@ function resetLobbyUi() {
   $('btnOnStart').hidden = true; $('onMatch').textContent = ''; onStatus('');
   for (const id of ['onVia', 'onCode', 'btnHost', 'btnJoin']) $(id).disabled = false;
 }
-$('btnOnline').addEventListener('click', () => { $('onTeam').value = $('selUser').value; resetLobbyUi(); showOnline(); });
+$('btnOnline').addEventListener('click', () => { $('onTeam').value = $('selUser').value; resetLobbyUi(); showOnline(); if (srv.base && !srv.ok && srv.done) checkServer(); });
 $('btnOnLeave').addEventListener('click', () => { leaveOnline(); $('online').hidden = true; $('menu').hidden = false; });
 
 function leaveOnline() {
@@ -8643,13 +8806,14 @@ $('btnHost').addEventListener('click', async () => {
   lockChoose('host');
   lobby = { role: 'host', via, code: newRoomCode(), sig: null, pending: null };
   onStatus('Setting up...');
+  if (srv.checking) await srv.checking;
   const ice = await myIce();
   lobby.ice = ice;
   if (via === 'manual') return hostManual(ice);
   $('onRoom').hidden = false; $('onRoomCode').textContent = lobby.code;
   $('onRoomNote').textContent = 'Tell your friend this code.';
   try {
-    lobby.sig = makeSignal(via, lobby.code, `host-${rid()}`);
+    lobby.sig = makeSignal(via, lobby.code, `host-${rid()}`, srvBase());
     await lobby.sig.open();
   } catch (e) { onStatus(`${e.message}`, true); return; }
   lobby.sig.onmsg = (m) => hostSignal(m).catch((e) => onStatus(`Connection error: ${e.message}`, true));
@@ -8662,8 +8826,21 @@ async function hostSignal(m) {
     if (net && !net.link.closed) return;                       // room is full
     const P = lobby.pending;
     // the same friend again: ignore, unless the direct try failed and they ask for the relay only
-    if (P && P.to === m.from && !(m.relay && !P.o.relayOnly)) return;
+    if (P && P.to === m.from && !(m.pipe && !P.pipe) && !(m.relay && !m.pipe && !P.o?.relayOnly)) return;
     if (P?.o && P.to === m.from) { P.o.link.onopen = null; P.o.link.close(); }
+    if (P?.pipe && P.to === m.from) { P.pipe.onopen = null; P.pipe.close(); }
+    const base = srvBase() || serverBase(m.srv);
+    if (m.pipe && base) {
+      // nothing direct works on their network: carry the game through the Mini2K server
+      onStatus('Direct connection blocked. Connecting through the Mini2K server...');
+      const id = newPipeId();
+      const link = new ServerLink(base, id);
+      lobby.pending = { to: m.from, pipe: link };
+      link.onopen = () => onLinked(link, 'host');
+      await link.connect();
+      await lobby.sig.send({ t: 'offer', to: m.from, pipe: id, srv: base });
+      return;
+    }
     const ice = mergeIce(lobby.ice, m.ice);                      // their relay settings count too
     const relayOnly = !!m.relay && hasTurn(ice);
     onStatus(relayOnly ? 'Direct connection blocked. Connecting through the relay...' : 'Your friend is here. Connecting...');
@@ -8716,15 +8893,28 @@ async function joinRoom(via, code) {
   lobby = { role: 'guest', via, code, sig: null, answered: false };
   $('onRoom').hidden = false; $('onRoomCode').textContent = code; $('onRoomNote').textContent = '';
   onStatus('Looking for the room...');
+  if (srv.checking) await srv.checking;
   const ice = await myIce();
   try {
-    lobby.sig = makeSignal(via, code, `guest-${rid()}`);
+    lobby.sig = makeSignal(via, code, `guest-${rid()}`, srvBase());
     await lobby.sig.open();
   } catch (e) { onStatus(e.message, true); return; }
   const L0 = lobby;
   L0.sig.onmsg = async (m) => {
-    if (m.t !== 'offer' || L0.answered || lobby !== L0 || (L0.relay && !m.relay)) return;
+    if (m.t !== 'offer' || L0.answered || lobby !== L0 || (L0.pipe ? !m.pipe : L0.relay && !m.relay)) return;
     L0.answered = true;
+    if (m.pipe) {
+      onStatus('Connecting through the Mini2K server...');
+      try {
+        L0.g?.pc.close();
+        const link = new ServerLink(serverBase(m.srv), m.pipe);
+        L0.g = { link };
+        link.onopen = () => { if (lobby === L0 && !netUp()) onLinked(link, 'guest'); else link.close(); };
+        await link.connect();
+        setTimeout(() => { if (lobby === L0 && !netUp()) onStatus('Could not connect through the Mini2K server. Try again.', true); }, 20000);
+      } catch (e) { onStatus(e.message, true); }
+      return;
+    }
     onStatus(m.relay ? 'Connecting through the relay...' : 'Found the room. Connecting...');
     try {
       const all = mergeIce(m.ice, ice);
@@ -8732,11 +8922,18 @@ async function joinRoom(via, code) {
       const g = L0.g = await guestAnswer(all, m.sdp, !!m.relay);
       relayCheck(all, g.answer);
       await L0.sig.send({ t: 'answer', to: m.from, sdp: g.answer });
-      // no direct route after a while (school wifi): ask the host again, relay only
+      // no direct route after a while (school wifi): ask the host again, relay (TURN) only, and if
+      // that fails too (or there is no TURN), through the Mini2K server
+      const usePipe = !!(srvBase() || m.srv);
       waitLink(g, !m.relay && hasTurn(all) ? () => {
-        if (lobby !== L0 || net) return;
+        if (lobby !== L0 || netUp()) return;
         L0.relay = true; L0.answered = false; tries = 0;
         onStatus('Direct connection blocked. Trying the relay...');
+        hello();
+      } : usePipe ? () => {
+        if (lobby !== L0 || netUp()) return;
+        L0.relay = true; L0.pipe = true; L0.answered = false; tries = 0;
+        onStatus('Direct connection blocked. Trying the Mini2K server...');
         hello();
       } : null);
     } catch (e) { onStatus(`Connection error: ${e.message}`, true); }
@@ -8746,21 +8943,23 @@ async function joinRoom(via, code) {
   const hello = async () => {
     if (lobby !== L0 || L0.answered) return;
     if (tries++ > 48) { onStatus('No room with that code answered. Check the code, and that your friend pressed Create room.', true); return; }
-    try { await L0.sig.send({ t: 'hello', ice: hasTurn(ice) ? ice : undefined, relay: L0.relay || undefined }); } catch (e) { onStatus(e.message, true); }
+    try { await L0.sig.send({ t: 'hello', ice: hasTurn(ice) ? ice : undefined, relay: L0.relay || undefined, pipe: L0.pipe || undefined, srv: srvBase() || undefined }); } catch (e) { onStatus(e.message, true); }
     setTimeout(hello, 2500);
   };
   hello();
 }
 
+/** A live connection (after a drop, `net` still holds the old, closed one until the rejoin). */
+const netUp = () => !!net && !net.link.closed;
 function waitLink(g, retryRelay = null) {
   const t = setTimeout(() => {
-    if (net) return;
+    if (netUp()) return;
     if (retryRelay) retryRelay();
     else if (lobby?.relayBad) onStatus('Could not connect: the network blocks direct connections and the relay (TURN) server did not accept the login. Check its address, username and password in Network settings, then try again.', true);
     else onStatus('Could not connect. The network is blocking the connection: add a relay (TURN) in Network settings on either computer, then try again.', true);
   }, retryRelay ? 9000 : 20000);
   g.linkReady.then((link) => {
-    const go = () => { clearTimeout(t); if (!net && (!lobby?.g || lobby.g === g)) onLinked(link, 'guest'); else if (lobby?.g !== g) link.close(); };
+    const go = () => { clearTimeout(t); if (!netUp() && (!lobby?.g || lobby.g === g)) onLinked(link, 'guest'); else if (lobby?.g !== g) link.close(); };
     if (link.open) go(); else link.onopen = go;
   });
 }
@@ -8813,7 +9012,7 @@ for (const id of ['onTeam', 'onQ', 'onDiff']) $(id).addEventListener('change', (
 function onlineConnected() {
   if (!net) return;
   $('onManual').hidden = true;
-  const route = net.route === 'relay' ? 'through the relay' : net.route === 'direct' ? 'directly' : '';
+  const route = net.route === 'relay' ? 'through the relay' : net.route === 'server' ? 'through the Mini2K server' : net.route === 'direct' ? 'directly' : '';
   onStatus(`Connected${route ? ` ${route}` : ''}${net.rtt ? ` (${Math.round(net.rtt)} ms)` : ''}.`);
   if (net.route === '?') net.link.route().then((r) => { if (net && r !== '?') { net.route = r; if (!$('online').hidden) onlineConnected(); } });
   const mine = $('onTeam').value, theirs = lobby?.their?.team;
@@ -8876,7 +9075,7 @@ setInterval(() => {
   if (!net.route || net.route === '?') net.link.route().then((r) => { net.route = r; });
   const ms = net.rtt != null ? `${Math.round(net.rtt)} MS` : '...';
   const behind = net.role === 'guest' ? net.buf.length : 0;
-  b.textContent = `ONLINE · ${net.side === 'home' ? 'HOME' : 'AWAY'} · ${ms}${net.route === 'relay' ? ' · RELAY' : ''}${behind > 6 ? ' · CATCHING UP' : ''}`;
+  b.textContent = `ONLINE · ${net.side === 'home' ? 'HOME' : 'AWAY'} · ${ms}${net.route === 'relay' ? ' · RELAY' : net.route === 'server' ? ' · SERVER' : ''}${behind > 6 ? ' · CATCHING UP' : ''}`;
   b.classList.toggle('bad', net.link.closed || (net.rtt ?? 0) > 200);
 }, 500);
 window.__netDebug = () => net && { role: net.role, tick: net.tick, buf: net.buf?.length, stats: net.stats, rtt: net.rtt, route: net.route };

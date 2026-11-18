@@ -8084,27 +8084,75 @@ export function makeSignal(kind, code, me) {
  */
 export async function iceServers(net = {}) {
   const list = [...STUN];
+  const problems = [];
   if (net.meteredUrl) {
     try {
       const r = await fetch(net.meteredUrl.trim());
       const j = await r.json();
-      if (Array.isArray(j)) list.push(...j);
-      else if (Array.isArray(j.iceServers)) list.push(...j.iceServers);
-    } catch { /* relay unavailable: direct only */ }
+      const got = Array.isArray(j) ? j : Array.isArray(j.iceServers) ? j.iceServers : [];
+      if (!got.length) problems.push('The Metered link gave no relay servers (check the API key).');
+      list.push(...got);
+    } catch { problems.push('Could not load the Metered link.'); }
   }
-  if (net.turnUrl) {
-    list.push({ urls: net.turnUrl.split(/[\s,]+/).filter(Boolean), username: net.turnUser || undefined, credential: net.turnPass || undefined });
+  const urls = turnUrls(net.turnUrl);
+  if (urls.length) {
+    if (!net.turnUser || !net.turnPass) problems.push('A TURN server needs both the username and the password.');
+    else list.push({ urls, username: net.turnUser.trim(), credential: net.turnPass });
   }
-  return list;
+  const ok = list.filter((s) => validIce(s) || (problems.push(`Skipped a relay address that is not valid: ${[].concat(s.urls).join(', ')}`), false));
+  ok.problems = problems;
+  return ok;
 }
+
+/**
+ * What people paste is often "relay.example.com:3478" or a full "turn:" line. Make proper TURN URLs and
+ * add a TCP version of each, because school wifi often blocks UDP (the usual TURN path) but allows TCP.
+ */
+export function turnUrls(text) {
+  const out = [];
+  for (let u of String(text ?? '').split(/[\s,;]+/).filter(Boolean)) {
+    u = u.replace(/^(https?|wss?):\/\//i, '');
+    if (!/^turns?:/i.test(u)) u = 'turn:' + u;
+    u = u.replace(/^turn(s?):\/\//i, 'turn$1:');
+    if (!/^turns?:[^?]+:\d+/i.test(u)) u = u.replace(/^(turns?:[^?]+)/i, (m, h) => h + (/^turns:/i.test(h) ? ':443' : ':3478'));
+    out.push(u);
+    if (/^turn:/i.test(u) && !/transport=/i.test(u)) out.push(u + '?transport=tcp');
+  }
+  return [...new Set(out)];
+}
+
+function validIce(s) {
+  if (typeof RTCPeerConnection === 'undefined') return true;
+  try { new RTCPeerConnection({ iceServers: [s] }).close(); return true; } catch { return false; }
+}
+
+/** Both screens' servers together (each side may have entered its own relay). */
+export function mergeIce(...lists) {
+  const seen = new Set(), out = [];
+  for (const l of lists) for (const s of l ?? []) { const k = JSON.stringify(s); if (!seen.has(k)) { seen.add(k); out.push(s); } }
+  return out;
+}
+export const hasTurn = (ice) => (ice ?? []).some((s) => [].concat(s.urls).some((u) => /^turns?:/i.test(u)));
+/** How many relay (TURN) candidates a description carries: 0 with a TURN server set means it did not answer. */
+export const relayCount = (sdp) => (String(sdp).match(/ typ relay/g) ?? []).length;
 
 // ------------------------------------------------------------------ peer connection
 
-function gathered(pc, ms = 4000) {
+/**
+ * Wait for the candidates (codes and the room service carry them all at once). A TURN server can be
+ * slow to answer, so with one set we wait for a relay candidate (up to 10 s) before sending.
+ */
+function gathered(pc, wantRelay) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((res) => {
-    const t = setTimeout(res, ms);
-    pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } });
+    let relay = false, done = false;
+    const end = () => { if (!done) { done = true; clearTimeout(cap); clearTimeout(soft); res(); } };
+    const cap = setTimeout(end, wantRelay ? 10000 : 4000);
+    const soft = setTimeout(() => { if (!wantRelay || relay) end(); }, 2500);
+    pc.addEventListener('icecandidate', (e) => {
+      if (e.candidate && / typ relay/.test(e.candidate.candidate)) { relay = true; setTimeout(end, 600); }
+    });
+    pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') end(); });
   });
 }
 
@@ -8159,22 +8207,22 @@ export class Link {
 }
 
 /** Host side: make an offer (with all candidates). Returns { link, offer, accept(answer) }. */
-export async function hostOffer(ice) {
-  const pc = new RTCPeerConnection({ iceServers: ice });
+export async function hostOffer(ice, relayOnly = false) {
+  const pc = new RTCPeerConnection({ iceServers: ice, iceTransportPolicy: relayOnly && hasTurn(ice) ? 'relay' : 'all' });
   const dc = pc.createDataChannel('mini2k', { ordered: true });
   const link = new Link(pc, dc);
   await pc.setLocalDescription(await pc.createOffer());
-  await gathered(pc);
-  return { link, offer: pc.localDescription.sdp, accept: (sdp) => pc.setRemoteDescription({ type: 'answer', sdp }) };
+  await gathered(pc, hasTurn(ice));
+  return { link, pc, relayOnly, offer: pc.localDescription.sdp, accept: (sdp) => pc.setRemoteDescription({ type: 'answer', sdp }) };
 }
 
 /** Guest side: answer an offer. Returns { link (opens by itself), answer }. */
-export async function guestAnswer(ice, offerSdp) {
-  const pc = new RTCPeerConnection({ iceServers: ice });
+export async function guestAnswer(ice, offerSdp, relayOnly = false) {
+  const pc = new RTCPeerConnection({ iceServers: ice, iceTransportPolicy: relayOnly && hasTurn(ice) ? 'relay' : 'all' });
   const ready = new Promise((res) => { pc.ondatachannel = (e) => res(e.channel); });
   await pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
   await pc.setLocalDescription(await pc.createAnswer());
-  await gathered(pc);
+  await gathered(pc, hasTurn(ice));
   const answer = pc.localDescription.sdp;
   const holder = { pc, answer, link: null };
   holder.linkReady = ready.then((dc) => (holder.link = new Link(pc, dc)));
@@ -8220,7 +8268,7 @@ import { Sound } from '@@render/audio.js@@';
 import { SW, SH } from '@@render/view.js@@';
 import { loadPixelFonts } from '@@ui/pixelfont.js@@';
 import { Session, makeOnlineGame } from '@@net/session.js@@';
-import { makeSignal, newRoomCode, cleanCode, iceServers, hostOffer, guestAnswer, packCode, unpackCode } from '@@net/peer.js@@';
+import { makeSignal, newRoomCode, cleanCode, iceServers, hostOffer, guestAnswer, packCode, unpackCode, mergeIce, hasTurn, relayCount } from '@@net/peer.js@@';
 
 loadPixelFonts();
 if (window.__MINI2K_DATA) document.querySelector('.head a')?.remove();   // the one-file build has no roster page
@@ -8527,12 +8575,31 @@ let netCfg = {};
 try { netCfg = JSON.parse(localStorage.getItem('mini2k.net') ?? '{}'); } catch { /* private mode */ }
 $('netMetered').value = netCfg.meteredUrl ?? ''; $('netTurn').value = netCfg.turnUrl ?? '';
 $('netUser').value = netCfg.turnUser ?? ''; $('netPass').value = netCfg.turnPass ?? '';
-$('btnNetSave').addEventListener('click', () => {
+/** The relay settings as typed right now (no need to press Save first), remembered for next time. */
+function readNet() {
   netCfg = { meteredUrl: $('netMetered').value.trim(), turnUrl: $('netTurn').value.trim(), turnUser: $('netUser').value.trim(), turnPass: $('netPass').value };
   try { localStorage.setItem('mini2k.net', JSON.stringify(netCfg)); } catch { /* ignore */ }
+  return netCfg;
+}
+$('btnNetSave').addEventListener('click', () => {
+  readNet();
   $('netSaved').textContent = 'Saved';
   setTimeout(() => { $('netSaved').textContent = ''; }, 1500);
 });
+for (const id of ['netMetered', 'netTurn', 'netUser', 'netPass']) $(id).addEventListener('change', readNet);
+/** ICE servers from the settings; says so on screen if the relay settings have a problem. */
+async function myIce() {
+  const ice = await iceServers(readNet());
+  if (ice.problems.length) onStatus(ice.problems.join(' '), true);
+  return ice;
+}
+/** After our candidates are gathered: a relay was set but its server gave no relay candidate. */
+function relayCheck(ice, sdp) {
+  if (!hasTurn(ice) || relayCount(sdp) > 0) return true;
+  if (lobby) lobby.relayBad = true;
+  onStatus('The relay (TURN) server did not answer. Check its address, username and password in Network settings. Trying without it...', true);
+  return false;
+}
 for (const id of teamIds) {
   const o = document.createElement('option');
   o.value = id; o.textContent = `${data.teams[id].name} (${Math.round(data.teams[id].team_overall)})`;
@@ -8576,7 +8643,7 @@ $('btnHost').addEventListener('click', async () => {
   lockChoose('host');
   lobby = { role: 'host', via, code: newRoomCode(), sig: null, pending: null };
   onStatus('Setting up...');
-  const ice = await iceServers(netCfg);
+  const ice = await myIce();
   lobby.ice = ice;
   if (via === 'manual') return hostManual(ice);
   $('onRoom').hidden = false; $('onRoomCode').textContent = lobby.code;
@@ -8593,12 +8660,19 @@ async function hostSignal(m) {
   if (!lobby || lobby.role !== 'host') return;
   if (m.t === 'hello') {
     if (net && !net.link.closed) return;                       // room is full
-    if (lobby.pending && lobby.pending.to === m.from) return;  // already answering this one
-    onStatus('Your friend is here. Connecting...');
-    const o = await hostOffer(lobby.ice);
-    lobby.pending = { to: m.from, o };
+    const P = lobby.pending;
+    // the same friend again: ignore, unless the direct try failed and they ask for the relay only
+    if (P && P.to === m.from && !(m.relay && !P.o.relayOnly)) return;
+    if (P?.o && P.to === m.from) { P.o.link.onopen = null; P.o.link.close(); }
+    const ice = mergeIce(lobby.ice, m.ice);                      // their relay settings count too
+    const relayOnly = !!m.relay && hasTurn(ice);
+    onStatus(relayOnly ? 'Direct connection blocked. Connecting through the relay...' : 'Your friend is here. Connecting...');
+    lobby.pending = { to: m.from, o: null };
+    const o = await hostOffer(ice, relayOnly);
+    lobby.pending.o = o;
+    relayCheck(ice, o.offer);
     o.link.onopen = () => onLinked(o.link, 'host');
-    await lobby.sig.send({ t: 'offer', to: m.from, sdp: o.offer, ice: lobby.ice });
+    await lobby.sig.send({ t: 'offer', to: m.from, sdp: o.offer, ice, relay: relayOnly });
   } else if (m.t === 'answer' && lobby.pending?.to === m.from) {
     await lobby.pending.o.accept(m.sdp);
   }
@@ -8610,6 +8684,7 @@ async function hostManual(ice) {
   $('onTheirLabel').textContent = '2. Paste the code your friend sends back';
   onStatus('Making your code...');
   const o = await hostOffer(ice);
+  relayCheck(ice, o.offer);
   lobby.pending = { o };
   o.link.onopen = () => onLinked(o.link, 'host');
   $('onMyCode').value = await packCode({ sdp: o.offer, ice });
@@ -8641,39 +8716,51 @@ async function joinRoom(via, code) {
   lobby = { role: 'guest', via, code, sig: null, answered: false };
   $('onRoom').hidden = false; $('onRoomCode').textContent = code; $('onRoomNote').textContent = '';
   onStatus('Looking for the room...');
-  const ice = await iceServers(netCfg);
+  const ice = await myIce();
   try {
     lobby.sig = makeSignal(via, code, `guest-${rid()}`);
     await lobby.sig.open();
   } catch (e) { onStatus(e.message, true); return; }
   const L0 = lobby;
   L0.sig.onmsg = async (m) => {
-    if (m.t !== 'offer' || L0.answered || lobby !== L0) return;
+    if (m.t !== 'offer' || L0.answered || lobby !== L0 || (L0.relay && !m.relay)) return;
     L0.answered = true;
-    onStatus('Found the room. Connecting...');
+    onStatus(m.relay ? 'Connecting through the relay...' : 'Found the room. Connecting...');
     try {
-      const g = await guestAnswer(m.ice?.length ? m.ice : ice, m.sdp);
+      const all = mergeIce(m.ice, ice);
+      L0.g?.pc.close();
+      const g = L0.g = await guestAnswer(all, m.sdp, !!m.relay);
+      relayCheck(all, g.answer);
       await L0.sig.send({ t: 'answer', to: m.from, sdp: g.answer });
-      waitLink(g);
+      // no direct route after a while (school wifi): ask the host again, relay only
+      waitLink(g, !m.relay && hasTurn(all) ? () => {
+        if (lobby !== L0 || net) return;
+        L0.relay = true; L0.answered = false; tries = 0;
+        onStatus('Direct connection blocked. Trying the relay...');
+        hello();
+      } : null);
     } catch (e) { onStatus(`Connection error: ${e.message}`, true); }
   };
-  // say hello until the host answers (it may not be listening yet)
+  // say hello until the host answers (it may not be listening yet); our relay settings go along
   let tries = 0;
   const hello = async () => {
     if (lobby !== L0 || L0.answered) return;
     if (tries++ > 48) { onStatus('No room with that code answered. Check the code, and that your friend pressed Create room.', true); return; }
-    try { await L0.sig.send({ t: 'hello' }); } catch (e) { onStatus(e.message, true); }
+    try { await L0.sig.send({ t: 'hello', ice: hasTurn(ice) ? ice : undefined, relay: L0.relay || undefined }); } catch (e) { onStatus(e.message, true); }
     setTimeout(hello, 2500);
   };
   hello();
 }
 
-function waitLink(g) {
+function waitLink(g, retryRelay = null) {
   const t = setTimeout(() => {
-    if (!net) onStatus('Could not connect. The network may be blocking direct connections: the room creator can add a relay in Network settings.', true);
-  }, 15000);
+    if (net) return;
+    if (retryRelay) retryRelay();
+    else if (lobby?.relayBad) onStatus('Could not connect: the network blocks direct connections and the relay (TURN) server did not accept the login. Check its address, username and password in Network settings, then try again.', true);
+    else onStatus('Could not connect. The network is blocking the connection: add a relay (TURN) in Network settings on either computer, then try again.', true);
+  }, retryRelay ? 9000 : 20000);
   g.linkReady.then((link) => {
-    const go = () => { clearTimeout(t); onLinked(link, 'guest'); };
+    const go = () => { clearTimeout(t); if (!net && (!lobby?.g || lobby.g === g)) onLinked(link, 'guest'); else if (lobby?.g !== g) link.close(); };
     if (link.open) go(); else link.onopen = go;
   });
 }
@@ -8686,7 +8773,9 @@ $('btnUseCode').addEventListener('click', async () => {
     if (lobby.role === 'host') { await lobby.pending.o.accept(obj.sdp); onStatus('Connecting...'); }
     else {
       onStatus('Making your code...');
-      const g = await guestAnswer(obj.ice?.length ? obj.ice : await iceServers(netCfg), obj.sdp);
+      const all = mergeIce(obj.ice, await myIce());
+      const g = await guestAnswer(all, obj.sdp);
+      relayCheck(all, g.answer);
       $('onMyCode').value = await packCode({ sdp: g.answer });
       onStatus('Send your code back, then wait here.');
       waitLink(g);

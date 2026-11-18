@@ -150,7 +150,7 @@
       <label>Controls <input type="checkbox" class="setHints"></label>
       <label>FPS <input type="checkbox" class="setFps"></label>
     </div>
-    <div class="actions"><button id="btnStart">Tip off</button><button class="ghost" id="btnOnline">Play a friend online</button><button class="ghost" id="btnDemo">Watch CPU vs CPU</button><button class="ghost btnFull">Fullscreen</button></div>
+    <div class="actions"><button id="btnStart">Tip Off Now</button><button class="ghost" id="btnOnline">Play a friend online</button><button class="ghost" id="btnDemo">Watch CPU vs CPU</button><button class="ghost btnFull">Fullscreen</button></div>
   </div>
 </div>
 
@@ -208,7 +208,7 @@
     </div>
     <div class="status" id="onStatus"></div>
     <div class="match" id="onMatch"></div>
-    <div class="actions"><button id="btnOnStart" hidden disabled>Tip off</button><button class="ghost" id="btnOnLeave">Back</button><button class="ghost btnFull">Fullscreen</button></div>
+    <div class="actions"><button id="btnOnStart" hidden disabled>Tip Off Now</button><button class="ghost" id="btnOnLeave">Back</button><button class="ghost btnFull">Fullscreen</button></div>
     <details>
       <summary>Network settings (for school or work wifi)</summary>
       <p>Most home connections link the two computers directly. School and office wifi often blocks that; then the game needs a relay (a TURN server) that both computers can reach. A free Metered account gives 20 GB a month, which is hundreds of games (one game uses roughly 30 to 60 MB). Only the person who creates the room needs to fill this in; the friend who joins gets it automatically.</p>
@@ -1963,6 +1963,8 @@ export class LiveGame {
     this._seen = 0;
     this.stats = { userShots: [] };
     this.ftMeter = null;       // user's free throw meter { t, dur, sweet, green, active }
+    this.remoteOnline = false;   // true when this is an online session and remote player timing is client-authoritative
+    this.pendingRemoteShot = {}; // keyed by side: shot result sent from the remote client
     this.double = null;        // user's double team { e, t }
     this.rebCtx = null;        // { hoop, side, land } while a shot is in the air
 
@@ -2386,13 +2388,27 @@ export class LiveGame {
       if (holder === ctrl) {
         if (input.pick && !this.meter) this.callPick(holder);
         if (!input.shoot) this.needRelease = false;
-        if (this.meter) {
+        if (this.remoteOnline && me !== this.user) {
+          // Remote player in an online game: shot timing is client-authoritative.
+          // The host does NOT run the meter for them; it waits for the shot_rel command.
+          if (input.shoot && !this.needRelease) {
+            // Show a pending state: start the meter shell for HUD purposes but don't time it
+            if (!this.meter) this.startMeter(holder); // sets up m.green/orange/etc for display
+          }
+          if (this.pendingRemoteShot[me] && input.shoot) {
+            const sr = this.pendingRemoteShot[me];
+            delete this.pendingRemoteShot[me];
+            this.meter = null;
+            if (sr.label) this.fxText(sr.label, holder.x, holder.y - 3.5, sr.color || '#fff');
+            return this.shoot(holder, 0, sr.forceMade === true, null, { makeProb: sr.makeProb, forceMade: sr.forceMade });
+          }
+        } else if (this.meter) {
           const lag = lagOf(input);
           this.meter.t += dt;
           this.meterContest(holder);
           // A very light tap is a pump fake; holding and letting go is the shot.
           if (!input.shoot && this.meter.t - lag < TAP_FAKE) this.pumpFake(holder);
-          else if (!input.shoot || this.meter.t >= this.meter.dur * 1.25 + lag) { this.releaseMeter(lag); return true; }
+          else if (!input.shoot || this.meter.t >= this.meter.dur * 1.18 + lag) { this.releaseMeter(lag); return true; }
         } else if (input.shoot && !this.needRelease) this.startMeter(holder);
         else if (input.pass && this.passTarget) { this.pass(holder, this.passTarget); return true; }
         else if (input.swap && this.callOop(holder)) return true;
@@ -2682,52 +2698,308 @@ export class LiveGame {
 
   // ------------------------------------------------------------------ shooting
 
+  /** Called by the network layer (Session) when the remote client sends their locally-timed shot result. */
+  applyRemoteShot(side, result) {
+    this.pendingRemoteShot[side] = result; // { makeProb, forceMade, label, color }
+  }
+
+  /**
+   * Compute the shot outcome from a local meter state (used by guest to determine result client-side).
+   * @param {object} m  Local meter snapshot { t, dur, green, orange, greenStart, greenEnd, orangeStart, ... }
+   * @param {object} h  The shooter entity
+   * @returns {{ makeProb, forceMade, label, color }}
+   */
+  calcMeterOutcome(m, h) {
+    const rel = Math.max(0, m.t) / m.dur;
+    const hasGreen = (m.green ?? 0) > 0;
+    const hasOrange = (m.orange ?? 0) > 0;
+    let label, color, makeProb, forceMade;
+    if (hasGreen && rel >= m.greenStart && rel <= m.greenEnd) {
+      label = 'GREEN!'; color = '#39e06a'; makeProb = 1.0; forceMade = true;
+    } else if (hasOrange && rel >= m.orangeStart && rel < m.greenStart) {
+      label = 'SLIGHTLY EARLY'; color = '#ff9a3a';
+      makeProb = this.calcOrangeProb(h, m); forceMade = null;
+    } else if (rel > (hasGreen ? m.greenEnd : 1.0)) {
+      label = 'VERY LATE'; color = '#ff4a3a'; makeProb = 0.0; forceMade = false;
+    } else {
+      label = 'VERY EARLY'; color = '#ff4a3a'; makeProb = 0.0; forceMade = false;
+    }
+    return { makeProb, forceMade, label, color };
+  }
+
+  /**
+   * Compute the FT outcome from a local FT meter state (used by guest client-side).
+   * @param {object} m  Local ftMeter snapshot
+   * @param {object} sh  Shooter entity
+   * @returns {{ prob, label, color }}
+   */
+  calcFtOutcome(m, sh) {
+    const rel = m.t / m.dur;
+    if (rel >= m.greenStart && rel <= m.greenEnd) {
+      return { prob: 1.0, label: 'GREEN!', color: '#39e06a' };
+    } else if (rel >= m.orangeStart && rel < m.greenStart) {
+      const base = M.freeThrowProb(this.p(sh.id), this.energy(sh));
+      return { prob: base, label: 'SLIGHTLY EARLY', color: '#ff9a3a' };
+    } else if (rel > m.greenEnd) {
+      return { prob: 0.0, label: 'VERY LATE', color: '#ff4a3a' };
+    } else {
+      return { prob: 0.0, label: 'VERY EARLY', color: '#ff4a3a' };
+    }
+  }
+
   startMeter(h) {
-    const zone = shotZone(h.x, h.y, this.hoopOf(h.side));
-    const A = this.p(h.id).attrs;
-    const attr = zone.type === 'three' ? A.three_pt : zone.type === 'mid' ? A.mid_range : A.finishing;
+    const hoop = this.hoopOf(h.side);
+    const d = distE(h, hoop);
+    const isRim = d <= COURT.RIM_RANGE;
+    const isMid = d < COURT.THREE_R;
     this.meter = {
-      t: 0, type: zone.type, dist: zone.dist,
-      dur: zone.type === 'rim' ? 0.5 : zone.type === 'mid' ? 0.72 : 0.8,
-      sweet: 0.78,
-      green: 0, baseGreen: clamp((0.032 + 0.0007 * (attr - 50)) * this.diff.greenScale, 0.015, 0.09),
+      t: 0,
+      dur: isRim ? 0.46 : isMid ? 0.58 : 0.66,
+      sweet: 1.0,
+      green: 0, orange: 0, greenStart: 0.95, greenEnd: 1.01, orangeStart: 0.77,
     };
     this.meterContest(h);
   }
 
-  /** The green window is widest when wide open and shrinks as the contest builds. */
+  /**
+   * Determine green and orange bar sizes dynamically factoring in:
+   * 1. Player attributes (3pt, mid, finishing, dunk, stamina, overall)
+   * 2. Shot type (rim/layup/dunk vs mid vs three)
+   * 3. Distance from basket (rim, short mid, deep mid, corner 3, wing 3, top 3, deep 3, half court)
+   * 4. Court location (corner 3 vs wing vs top of key)
+   * 5. Defensive contest (wide open expands bar; heavy contest shrinks; contested half court has no green)
+   */
   meterContest(h) {
-    const m = this.meter, c = this.contest(h);
+    const m = this.meter;
+    if (!m) return;
+    const hoop = this.hoopOf(h.side);
+    const d = distE(h, hoop);
+    const fromBase = hoop.x > COURT.L / 2 ? COURT.L - h.x : h.x;
+    const dy = Math.abs(h.y - COURT.W / 2);
+    const c = this.contest(h);
     m.contest = c;
-    // Adaptive window: 1.4x the shooter's base when wide open, down to 0.3x when smothered.
-    // The floor keeps it at least about one frame wide, so a perfect release is always possible.
-    // Deep range: past about 25 ft the window collapses fast, even with nobody near (0.25x by 31 ft).
-    m.deep = m.type === 'three' ? clamp(1 - (m.dist - 24.5) / 8.5, 0.25, 1) : 1;
-    // Tough angle (behind the backboard, on the baseline or sideline): same treatment, down to 0.25x.
-    m.tough = this.toughAngle(h).sev;
-    const hard = m.deep * (1 - 0.75 * m.tough);
-    const floor = Math.max(0.01, 0.6 / 60 / m.dur) * (hard < 0.95 ? 0.6 : 1);
-    m.green = clamp(m.baseGreen * GREEN_SCALE * hard * (1.4 - 1.1 * c.score), floor, 0.11);
+    const ta = this.toughAngle(h, hoop);
+    m.tough = ta.sev;
+    m.behind = ta.behind;
+    m.dist = d;
+
+    // Classify shot type and specific court location
+    let type, loc;
+    if (d <= COURT.RIM_RANGE) {
+      type = 'rim';
+      loc = d <= 4.0 ? 'rim_point_blank' : 'rim_layup';
+    } else if (d >= COURT.THREE_R || (dy >= COURT.CORNER_D && fromBase <= COURT.CORNER_X)) {
+      type = 'three';
+      if (d > 38) loc = 'half_court';
+      else if (d > 27) loc = 'deep_3';
+      else if (dy >= COURT.CORNER_D && fromBase <= COURT.CORNER_X) loc = 'corner_3';
+      else if (dy < 7.5) loc = 'top_3';
+      else loc = 'wing_3';
+    } else {
+      type = 'mid';
+      loc = d <= 12 ? 'mid_close' : 'mid_long';
+    }
+    m.type = type;
+    m.loc = loc;
+
+    // Relevant player attribute
+    const P = this.p(h.id);
+    const A = P.attrs;
+    let attr;
+    if (type === 'rim') attr = 0.65 * A.finishing + 0.35 * A.dunk;
+    else if (type === 'mid') attr = A.mid_range;
+    else attr = A.three_pt;
+    const ovr = P.overall ?? attr;
+    const effectiveRating = 0.75 * attr + 0.25 * ovr;
+
+    // Rating multiplier (average player ~72 -> ~0.75; elite 95+ -> ~1.0; low 50 -> ~0.55)
+    const ratingMult = clamp(0.55 + 0.009 * (effectiveRating - 50), 0.38, 1.35);
+    const energyMult = 0.8 + 0.2 * this.energy(h);
+
+    // Distance decay multiplier
+    let distMult = 1.0;
+    if (type === 'rim') {
+      distMult = d <= 3.5 ? 1.25 : 1.0;
+    } else if (type === 'mid') {
+      distMult = clamp(1.05 - (d - 7) * 0.015, 0.8, 1.05);
+    } else {
+      // Three-pointer
+      if (loc === 'corner_3') distMult = 1.15; // Corner 3 distance & angle advantage
+      else if (loc === 'wing_3') distMult = 1.0;
+      else if (loc === 'top_3') distMult = 0.95; // Top of key is slightly longer (23.75 ft)
+      else if (loc === 'deep_3') distMult = clamp(0.9 - (d - 27) * 0.05, 0.25, 0.9);
+      else if (loc === 'half_court') distMult = clamp(0.2 - (d - 38) * 0.012, 0.02, 0.2);
+    }
+
+    // Defensive contest multiplier
+    // Wide open (c.score <= 0.05) expands the bar; heavy contest shrinks it
+    let contestMult;
+    if (c.score <= 0.05) contestMult = 1.35;
+    else if (c.score <= 0.20) contestMult = 1.05;
+    else if (c.score <= 0.35) contestMult = 0.82;
+    else if (c.score <= 0.50) contestMult = 0.55;
+    else if (c.score <= 0.68) contestMult = 0.34;
+    else if (c.score <= 0.84) contestMult = 0.18;
+    else contestMult = 0.10; // Smothered
+
+    // Angle difficulty
+    const hardAngle = Math.max(0.1, 1 - 0.85 * m.tough);
+
+    // Base green and orange window by location
+    const BASE_GREEN = {
+      rim_point_blank: 0.19,
+      rim_layup: 0.14,
+      mid_close: 0.095,
+      mid_long: 0.070,
+      corner_3: 0.068,
+      wing_3: 0.056,
+      top_3: 0.050,
+      deep_3: 0.024,
+      half_court: 0.010,
+    };
+    const BASE_ORANGE = {
+      rim_point_blank: 0.24,
+      rim_layup: 0.21,
+      mid_close: 0.18,
+      mid_long: 0.16,
+      corner_3: 0.18,
+      wing_3: 0.15,
+      top_3: 0.14,
+      deep_3: 0.09,
+      half_court: 0.035,
+    };
+
+    const diffScale = this.diff.greenScale;
+
+    // Calculate final green and orange window size
+    let gSize = BASE_GREEN[loc] * ratingMult * energyMult * distMult * contestMult * hardAngle * diffScale;
+    let oSize = BASE_ORANGE[loc] * ratingMult * energyMult * distMult * contestMult * hardAngle * diffScale;
+    // Enlarge orange bar for a more forgiving window
+    oSize *= 1.2;
+
+    // Requirement: A contested half court pull up shouldn't have a green bar at all
+    if (loc === 'half_court' && c.score > 0.15) {
+      gSize = 0;
+      oSize = c.score > 0.4 ? 0 : oSize * 0.3;
+    }
+    // Also deep 3 heavily contested or smothered has no green bar
+    if (loc === 'deep_3' && c.score > 0.65) {
+      gSize = 0;
+    }
+
+    // Clamp green window
+    if (gSize > 0) {
+      gSize = clamp(gSize, 0.012, 0.28);
+    } else {
+      gSize = 0;
+    }
+
+    // Clamp orange window
+    if (oSize > 0) {
+      oSize = clamp(oSize, 0.02, 0.30);
+    } else {
+      oSize = 0;
+    }
+
+    m.green = gSize;
+    m.orange = oSize;
+    m.greenStart = gSize > 0 ? 1.0 - gSize : 1.05;
+    m.greenEnd = gSize > 0 ? 1.01 : -1;
+    m.orangeStart = oSize > 0 ? Math.max(0.08, m.greenStart - oSize) : m.greenStart;
+  }
+
+  calcOrangeProb(h, m) {
+    const P = this.p(h.id);
+    const A = P.attrs;
+    const loc = m.loc ?? 'wing_3';
+    const c = m.contest ?? this.contest(h);
+    const d = m.dist ?? 20;
+
+    // 1. Base open make probability by location & attribute
+    let attr, pBase;
+    if (m.type === 'rim') {
+      attr = 0.65 * A.finishing + 0.35 * A.dunk;
+      pBase = loc === 'rim_point_blank'
+        ? clamp(0.72 + 0.0035 * (attr - 50), 0.58, 0.95)
+        : clamp(0.62 + 0.0032 * (attr - 50), 0.46, 0.90);
+    } else if (m.type === 'mid') {
+      attr = A.mid_range;
+      pBase = loc === 'mid_close'
+        ? clamp(0.52 + 0.0030 * (attr - 50), 0.36, 0.85)
+        : clamp(0.44 + 0.0028 * (attr - 50), 0.28, 0.78);
+    } else {
+      attr = A.three_pt;
+      if (loc === 'corner_3') pBase = clamp(0.44 + 0.0032 * (attr - 50), 0.28, 0.80);
+      else if (loc === 'wing_3') pBase = clamp(0.38 + 0.0030 * (attr - 50), 0.22, 0.74);
+      else if (loc === 'top_3') pBase = clamp(0.34 + 0.0028 * (attr - 50), 0.18, 0.70);
+      else if (loc === 'deep_3') pBase = clamp(0.20 + 0.0020 * (attr - 50) - (d - 27) * 0.015, 0.04, 0.45);
+      else pBase = clamp(0.04 - (d - 38) * 0.001, 0.005, 0.05); // half-court
+    }
+
+    // 2. Stamina multiplier
+    pBase *= 0.75 + 0.25 * this.energy(h);
+
+    // 3. Contest scaling
+    // Smothered (c.score >= 0.82) -> 0% in orange
+    let contestFactor;
+    if (m.type === 'rim') {
+      contestFactor = Math.max(0, 1 - Math.pow(c.score / 0.88, 1.4));
+    } else {
+      contestFactor = Math.max(0, 1 - Math.pow(c.score / 0.80, 1.6));
+    }
+
+    // Half-court contested: 0% in orange
+    if (loc === 'half_court' && c.score > 0.12) contestFactor = 0;
+    if (loc === 'deep_3' && c.score > 0.5) contestFactor *= 0.3;
+
+    // 4. Angle penalty
+    const angleFactor = Math.max(0.1, 1 - 0.75 * (m.tough ?? 0));
+
+    return clamp(pBase * contestFactor * angleFactor * 1.1, 0, 0.94); // slightly higher make % for orange
   }
 
   releaseMeter(lag = 0) {
     const m = this.meter, h = this.ball.holder;
     this.meter = null;
     const rel = Math.max(0, m.t - lag) / m.dur;
-    const err = Math.abs(rel - m.sweet);
-    let mod, label;
-    if (err <= m.green) { mod = 0.12; label = 'Perfect'; }
-    else {
-      mod = Math.max(-0.28, 0.05 - (err - m.green) * 1.1);
-      const side = rel < m.sweet ? 'early' : 'late';
-      label = mod > 0 ? 'Good' : mod > -0.1 ? `Slightly ${side}` : `Too ${side}`;
+    let label, color, makeProb, forceMade;
+
+    const hasGreen = (m.green ?? 0) > 0;
+    const hasOrange = (m.orange ?? 0) > 0;
+
+    if (hasGreen && rel >= m.greenStart && rel <= m.greenEnd) {
+      // 1. Green bar: at the top and smaller, guaranteed in (even if smothered)
+      label = 'GREEN!';
+      color = '#39e06a';
+      makeProb = 1.0;
+      forceMade = true;
+      this.lastGreen = true;
+    } else if (hasOrange && rel >= m.orangeStart && rel < m.greenStart) {
+      // 2. Orange bar: dynamically dependent on coverage, location, distance, ratings
+      label = 'SLIGHTLY EARLY';
+      color = '#ff9a3a';
+      makeProb = this.calcOrangeProb(h, m);
+      forceMade = null;
+    } else if (rel > (hasGreen ? m.greenEnd : 1.0)) {
+      // 3. Overshot green: guaranteed miss
+      label = 'VERY LATE';
+      color = '#ff4a3a';
+      makeProb = 0.0;
+      forceMade = false;
+    } else {
+      // 4. Not orange (too early): guaranteed miss
+      label = 'VERY EARLY';
+      color = '#ff4a3a';
+      makeProb = 0.0;
+      forceMade = false;
     }
-    this.fxText(label, h.x, h.y - 3.5, label === 'Perfect' ? '#39e06a' : mod > 0 ? '#c8f08f' : '#ffb347');
-    this.stats.userShots.push({ rel, mod, label });
-    return this.shoot(h, mod, label === 'Perfect');
+
+    this.fxText(label, h.x, h.y - 3.5, color);
+    this.stats.userShots.push({ rel, label, makeProb });
+    return this.shoot(h, 0, forceMade === true, null, { makeProb, forceMade });
   }
 
-  shoot(e, timingMod = 0, perfect = false, extra = null) {
+  shoot(e, timingMod = 0, perfect = false, extra = null, shotResult = null) {
     const g = this.game, side = e.side;
     const hoop = this.hoopOf(side);
     const zone = shotZone(e.x, e.y, hoop);
@@ -2752,12 +3024,14 @@ export class LiveGame {
     const fastBreak = this.transition && this.possT < 8 && back <= 1 && zone.type === 'rim';
     const from = { x: e.x, y: e.y };
     const i0 = g.events.length;
+    const makeProb = shotResult ? shotResult.makeProb : (perfect ? 1.0 : null);
+    const forceMade = shotResult ? shotResult.forceMade : (perfect ? true : null);
     g.resolveShot({
       offSide: side, shooter: e.id, type: zone.type, defender: contested ? nd.e.id : null,
       exact: true, assist, fastBreak, heave: zone.dist > 42, difficultyMod: mod,
       forceFoul: contested ? undefined : false, foulScale: 0.8,
-      // a Perfect release is 90%, except from behind the backboard where even perfect timing is a prayer
-      makeProb: perfect && zone.dist <= 42 ? PERFECT_MAKE * (1 - 0.5 * ta.behind) : null, makeScale,
+      makeProb, forceMade,
+      makeScale: shotResult?.makeProb != null ? 1 : makeScale,
     });
     this.play(i0, { from, hoop, zone, cs: c.score, tough: ta.sev, ...extra });
   }
@@ -2859,9 +3133,11 @@ export class LiveGame {
           if (this.isHuman(st.side)) {
             this.uc[st.side].ctrl = shooter;
             const ftA = this.p(shooter.id).attrs.free_throw;
+            const green = clamp((0.040 + 0.001 * (ftA - 50)) * this.diff.greenScale, 0.024, 0.08);
+            const orange = 0.20;
             this.ftMeter = {
-              t: 0, dur: 0.9, sweet: 0.78, type: 'ft', active: false, armed: false, wait: 0,
-              green: clamp((0.035 + 0.0011 * (ftA - 50)) * this.diff.greenScale, 0.02, 0.1),
+              t: 0, dur: 0.72, sweet: 1.0, type: 'ft', active: false, armed: false, wait: 0,
+              green, greenStart: 1.0 - green, greenEnd: 1.01, orange, orangeStart: 1.0 - green - orange,
             };
           }
         }
@@ -2964,22 +3240,47 @@ export class LiveGame {
         if (!input.shoot) m.armed = true;
         else if (m.armed) m.active = true;
         if (m.wait > 8) go = true;                  // took too long: he shoots it himself
+      } else if (this.remoteOnline && this.ftLine?.side !== this.user) {
+        // Remote player FT: client-authoritative. The host waits for ft_rel command.
+        m.t += dt;
+        const sr = this.pendingRemoteShot[this.ftLine.side];
+        if (sr) {
+          delete this.pendingRemoteShot[this.ftLine.side];
+          if (sr.label) this.fxText(sr.label, sh.x, sh.y - 3.5, sr.color || '#fff');
+          prob = sr.makeProb;
+          go = true;
+        } else if (m.t >= m.dur * 2.5) {
+          // Timeout: shot clock expired without a release from the client
+          prob = M.freeThrowProb(this.p(sh.id), this.energy(sh)) * 0.6;
+          go = true;
+        }
       } else {
         const lag = lagOf(input);
         m.t += dt;
-        if (!input.shoot || m.t >= m.dur * 1.25 + lag) {
-          const rel = Math.max(0, m.t - lag) / m.dur, err = Math.abs(rel - m.sweet);
+        if (!input.shoot || m.t >= m.dur * 1.18 + lag) {
+          const rel = Math.max(0, m.t - lag) / m.dur;
           const base = M.freeThrowProb(this.p(sh.id), this.energy(sh));
-          let label;
-          if (err <= m.green) { prob = Math.max(base, 0.96); label = 'Perfect'; }
-          else {
-            const k = clamp(1 - (err - m.green) * 2.6, 0.15, 1);
-            prob = base * k;
-            const side = rel < m.sweet ? 'early' : 'late';
-            label = k > 0.9 ? 'Good' : k > 0.7 ? `Slightly ${side}` : `Too ${side}`;
+          let label, color;
+          if (rel >= m.greenStart && rel <= m.greenEnd) {
+            prob = 1.0;
+            label = 'GREEN!';
+            color = '#39e06a';
+            this.lastGreen = true;
+          } else if (rel >= m.orangeStart && rel < m.greenStart) {
+            prob = base;
+            label = 'SLIGHTLY EARLY';
+            color = '#ff9a3a';
+          } else if (rel > m.greenEnd) {
+            prob = 0.0;
+            label = 'VERY LATE';
+            color = '#ff4a3a';
+          } else {
+            prob = 0.0;
+            label = 'VERY EARLY';
+            color = '#ff4a3a';
           }
-          this.fxText(label, sh.x, sh.y - 3.5, label === 'Perfect' ? '#39e06a' : label === 'Good' ? '#c8f08f' : '#ffb347');
-          (this.stats.userFts ??= []).push({ rel, label });
+          this.fxText(label, sh.x, sh.y - 3.5, color);
+          (this.stats.userFts ??= []).push({ rel, label, prob });
           go = true;
         }
       }
@@ -3600,18 +3901,52 @@ function drawMeter(ctx, live) {
   if (!m || !h) return;
   // Draw the meter on the side away from the hoop so it does not cover the defender.
   const x = X(h.x) + (live.dirRight(h.side) ? -40 : 28), y = Y(h.y) - 34, w = 12, hgt = 68;
-  const top = 1.25; // bar spans 0..1.25 of the wind-up
-  ctx.fillStyle = 'rgba(10,12,16,0.85)'; roundRect(ctx, x - 3, y - 3, w + 6, hgt + 6, 5); ctx.fill();
-  const yOf = (rel) => y + hgt - (rel / top) * hgt;
-  ctx.fillStyle = 'rgba(57,224,106,0.35)';
-  ctx.fillRect(x, yOf(m.sweet + m.green * 3), w, yOf(m.sweet - m.green * 3) - yOf(m.sweet + m.green * 3));
-  ctx.fillStyle = '#39e06a';
-  ctx.fillRect(x, yOf(m.sweet + m.green), w, Math.max(3, yOf(m.sweet - m.green) - yOf(m.sweet + m.green)));
-  const rel = Math.min(top, m.t / m.dur);
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(x - 3, yOf(rel) - 2, w + 6, 4);
-  ctx.fillStyle = 'rgba(255,255,255,0.35)';
-  ctx.fillRect(x + 4, yOf(rel), 4, y + hgt - yOf(rel));
+  const hasGreen = (m.green ?? 0) > 0;
+  const hasOrange = (m.orange ?? 0) > 0;
+  const g0 = hasGreen ? m.greenStart : 1.05;
+  const o0 = hasOrange ? m.orangeStart : g0;
+  const yOf = (rel) => y + hgt - clamp(rel, 0, 1.0) * hgt;
+
+  // Background
+  ctx.fillStyle = 'rgba(10,12,16,0.9)'; roundRect(ctx, x - 3, y - 3, w + 6, hgt + 6, 5); ctx.fill();
+  ctx.fillStyle = '#161b26'; ctx.fillRect(x, y, w, hgt);
+
+  // Orange bar (height directly reflects m.orange)
+  if (hasOrange && g0 > o0) {
+    const yTop = yOf(Math.min(1.0, g0));
+    const yBot = yOf(o0);
+    ctx.fillStyle = '#ff9a3a';
+    ctx.fillRect(x, yTop, w, Math.max(2, yBot - yTop));
+  }
+
+  // Green bar at the top (height directly reflects m.green)
+  if (hasGreen) {
+    const hG = Math.max(3, Math.round(m.green * hgt));
+    ctx.fillStyle = '#22c55e';
+    ctx.fillRect(x, y, w, hG);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(x - 2, y, w + 4, 2);
+  } else {
+    // Grayed out line when no green bar
+    ctx.fillStyle = '#64748b';
+    ctx.fillRect(x - 2, y, w + 4, 2);
+  }
+
+  // Current fill
+  const rel = m.t / m.dur;
+  if (rel > (hasGreen ? (m.greenEnd ?? 1.01) : 1.0)) {
+    // Overshot: red flash
+    ctx.fillStyle = '#ff4a3a';
+    ctx.fillRect(x, y, w, hgt);
+    ctx.fillRect(x - 3, y - 4, w + 6, 4);
+  } else {
+    const yRel = yOf(rel);
+    const fillCol = (hasGreen && rel >= g0) ? '#4ade80' : (hasOrange && rel >= o0) ? '#ffd54f' : '#e2e8f0';
+    ctx.fillStyle = fillCol;
+    ctx.fillRect(x + 3, yRel, w - 6, y + hgt - yRel);
+    ctx.fillStyle = (hasGreen && rel >= g0) ? '#ffffff' : (hasOrange && rel >= o0) ? '#ffffff' : '#ffd84a';
+    ctx.fillRect(x - 3, yRel - 2, w + 6, 4);
+  }
 }
 
 function drawHud(ctx, live) {
@@ -5771,6 +6106,7 @@ export class Actors {
       const a = e && this.byEnt.get(e);
       if (a?.one?.driven === 'windup' && !(st && st.k === 'shot')) a.one = null;
     }
+    if (L.lastGreen) { L.lastGreen = false; this.cue('green'); }
     this.lastPhase = L.phase; this.lastStep = st; this.lastFlight = fl; this.lastWindup = w; this.lastMeter = m;
 
     // --- everyone
@@ -6437,12 +6773,42 @@ export class Hud {
   meter(c, sx, sy, a, edge = '#05060a', m = this.L.meter) {
     if (!m) return;
     const H = 34, x = sx + (a.left ? -19 : 15), y = sy - 58;
-    box(c, x - 2, y - 2, 9, H + 4, '#05060a'); box(c, x - 1, y - 1, 7, H + 2, edge); box(c, x, y, 5, H, '#262a38');
-    const g0 = m.sweet - m.green, g1 = m.sweet + m.green;
-    box(c, x, y + H - Math.round(g1 * H / 1.25) , 5, Math.max(2, Math.round((g1 - g0) * H / 1.25)), '#39e06a');
-    const u = Math.min(1.25, m.t / m.dur);
-    const fh = Math.round(u * H / 1.25);
-    box(c, x + 1, y + H - fh, 3, fh, u > g1 ? '#ff6b5a' : u >= g0 ? '#eafff0' : '#f3d35a');
+    box(c, x - 2, y - 2, 9, H + 4, '#05060a'); box(c, x - 1, y - 1, 7, H + 2, edge); box(c, x, y, 5, H, '#161a24');
+    
+    const hasGreen = (m.green ?? 0) > 0;
+    const hasOrange = (m.orange ?? 0) > 0;
+    const g0 = hasGreen ? m.greenStart : 1.05;
+    const o0 = hasOrange ? m.orangeStart : g0;
+
+    // Orange bar (below green, height dynamically reflects m.orange)
+    if (hasOrange && g0 > o0) {
+      const yO = y + H - Math.round(Math.min(1.0, g0) * H);
+      const hO = Math.max(1, Math.round((Math.min(1.0, g0) - o0) * H));
+      box(c, x, yO, 5, hO, '#d97706'); box(c, x + 1, yO, 3, hO, '#ff9a3a');
+    }
+
+    // Green bar (at the top, height dynamically reflects m.green)
+    if (hasGreen) {
+      const hG = Math.max(2, Math.round(m.green * H));
+      box(c, x, y, 5, hG, '#15803d'); box(c, x + 1, y, 3, hG, '#22c55e');
+      box(c, x - 1, y, 7, 1, '#ffffff'); // release tick at very top
+    } else {
+      // No green bar (e.g. contested half court)
+      box(c, x - 1, y, 7, 1, '#64748b');
+    }
+
+    // Rising fill
+    const u = m.t / m.dur;
+    if (u > (hasGreen ? (m.greenEnd ?? 1.01) : 1.0)) {
+      // Overshot: red flash
+      box(c, x - 1, y - 3, 7, 3, '#ff4a3a');
+      box(c, x + 1, y, 3, H, '#ff4a3a');
+    } else {
+      const fh = Math.min(H, Math.round(u * H));
+      const col = (hasGreen && u >= g0) ? '#ffffff' : (hasOrange && u >= o0) ? '#ffd54f' : '#e2e8f0';
+      box(c, x + 1, y + H - fh, 3, fh, col);
+      box(c, x - 1, y + H - fh, 7, 2, (hasGreen && u >= g0) ? '#ffffff' : (hasOrange && u >= o0) ? '#ffffff' : '#ffd84a');
+    }
   }
 
   /** Timeout / end-of-period stats card. */
@@ -6969,6 +7335,7 @@ export class Sound {
       case 'buzzer': this.tone('sawtooth', 196, 196, 1.1, 0.3); this.tone('square', 98, 98, 1.1, 0.2); break;
       case 'cheer': this.burst('bandpass', 1100, 0.4, 1.4, 0.5); break;
       case 'sub': this.tone('sine', 660, 880, 0.12, 0.12); break;
+      case 'green': this.tone('sine', 880, 1760, 0.12, 0.35); this.tone('triangle', 1320, 2640, 0.08, 0.2, 0.03); break;
     }
   }
 }
@@ -7386,6 +7753,11 @@ export class Session {
     this.acc = 0; this.inAcc = 0; this.iq = []; this.waitSnap = false;
     this.target = TARGET; this.calmT = 0;
     this.stats = { snaps: 0, snapsFar: 0, fast: 0, ffw: 0, mismatches: 0, dry: 0 };
+    // Client-authoritative shot meter (guest only): tracks shot meter locally at zero latency
+    this.localMeter = null;     // local shot meter state for the guest's own shots
+    this.localFtMeter = null;   // local FT meter state
+    this.localShootHeld = false; // was shoot held last frame (for edge detection)
+    this.localFtShootHeld = false;
     link.onmsg = (m) => this.onMsg(m);
     link.onclose = (why) => this.ui.onClose?.(why);
     link.route().then((r) => { this.route = r; });
@@ -7420,6 +7792,7 @@ export class Session {
   /** Host: start (or restart for a rejoining guest) the game with this config. */
   hostStart(live, cfg) {
     this.live = live; this.cfg = cfg; this.tick = 0;
+    if (live) live.remoteOnline = true; // guest shots are client-authoritative
     this.link.send({ t: 'start', cfg });
   }
   /** Host: the guest reconnected mid-game. */
@@ -7451,6 +7824,15 @@ export class Session {
   guestCmd(c) {
     const T = this.live?.state.teams.away;
     if (!c || !T) return;
+    // Client-authoritative shot timing: the guest sends its locally-timed shot result
+    if (c.k === 'shot_rel') {
+      if (this.live && c.result) this.live.applyRemoteShot('away', c.result);
+      return;
+    }
+    if (c.k === 'ft_rel') {
+      if (this.live && c.result) this.live.applyRemoteShot('away', c.result);
+      return;
+    }
     const cmd = { k: c.k, s: 'away' };                     // the guest can only ask for its own team
     if (c.k === 'sub') {
       if (!T.onCourt.includes(c.o)) return;
@@ -7492,7 +7874,10 @@ export class Session {
     this.cfg = cfg; this.tick = 0; this.buf = []; this.expect.clear(); this.waitSnap = false;
     this.ui.onStart?.(cfg);        // main creates the LiveGame and calls setLive()
   }
-  setLive(live) { this.live = live; }
+  setLive(live) {
+    this.live = live;
+    if (live) live.remoteOnline = true; // local meter managed here on the guest side
+  }
 
   gotFrames(m) {
     if (this.waitSnap) return;          // a snapshot is on its way; these are older than it
@@ -7546,6 +7931,9 @@ export class Session {
     if (this.inAcc > STEP) this.inAcc = 0;
     if (this.iq.length && !this.paused && this.live?.phase !== 'final') this.link.send({ t: 'i', q: this.iq });
     this.iq = [];
+    // ---- client-authoritative shot meter (zero-latency, local) ----
+    this._tickLocalMeter(dt, keys, inputOn);
+    // ----------------------------------------------------------------
     if (!this.live || this.waitSnap) return 1;
 
     // 2) frames
@@ -7573,6 +7961,97 @@ export class Session {
       if ((this.calmT += dt) > 10 && this.target > TARGET) { this.target--; this.calmT = 0; }
     }
     return Math.min(1, this.acc / STEP);
+  }
+
+  /** Guest: tick the local shot meter from real-time keys; send shot result to host when releasing. */
+  _tickLocalMeter(dt, keys, inputOn) {
+    if (!this.live || !inputOn) return;
+    const L = this.live;
+    const snap = keys.snapshot(); // read-only peek at current key state
+    const shootNow = !!snap.shoot;
+
+    // ---- FT meter ----
+    if (L.ftMeter !== null || this.localFtMeter) {
+      // Sync local meter from live (live gets ftMeter started by the engine when ft phase begins)
+      if (L.ftMeter && !this.localFtMeter) {
+        this.localFtMeter = { ...L.ftMeter }; // copy fields
+        this.localFtShootHeld = shootNow;
+      }
+      const lft = this.localFtMeter;
+      if (lft) {
+        if (!lft.active) {
+          if (!shootNow) lft.armed = true;
+          else if (lft.armed) lft.active = true;
+          lft.wait += dt;
+          if (lft.wait > 8) {
+            // Took too long: auto-release
+            const ftSh = L.ftLine?.shooter; const { prob, label, color } = ftSh ? L.calcFtOutcome(lft, ftSh) : { prob: 0.75, label: 'SLIGHTLY EARLY', color: '#ff9a3a' };
+            this._sendFtRel({ makeProb: prob, forceMade: null, label, color });
+            this.localFtMeter = null;
+          }
+        } else {
+          lft.t += dt;
+          if (!shootNow || lft.t >= lft.dur * 1.18) {
+            const ftSh = L.ftLine?.shooter; const { prob, label, color } = ftSh ? L.calcFtOutcome(lft, ftSh) : { prob: 0.75, label: 'SLIGHTLY EARLY', color: '#ff9a3a' };
+            this._sendFtRel({ makeProb: prob, forceMade: null, label, color });
+            this.localFtMeter = null;
+          }
+        }
+        // Reflect local meter back to live so HUD renders it
+        if (this.localFtMeter) {
+          L.ftMeter = { ...this.localFtMeter };
+        } else {
+          L.ftMeter = null;
+        }
+      }
+      return; // FT mode: don't process regular shot meter
+    }
+
+    // ---- Shot meter ----
+    const ctrl = L.user ? L.uc[L.user]?.ctrl : null;
+    const holder = L.ball?.holder;
+    // Only run local meter when our controlled player has the ball
+    if (!ctrl || holder !== ctrl) {
+      if (this.localMeter) { this.localMeter = null; L.meter = null; }
+      this.localShootHeld = shootNow;
+      return;
+    }
+
+    const lm = this.localMeter;
+    if (lm) {
+      lm.t += dt;
+      // lm IS L.meter (same reference); meterContest updates green/orange windows in-place
+      L.meter = lm;
+      L.meterContest(holder); // updates lm.green, lm.orange, etc. dynamically
+
+      const overshoot = lm.t >= lm.dur * 1.18;
+      if (!shootNow || overshoot) {
+        // Release: compute outcome
+        const result = L.calcMeterOutcome(lm, holder);
+        this._sendShotRel(result);
+        this.localMeter = null;
+        L.meter = null;
+      } else {
+        L.meter = lm; // keep HUD in sync
+      }
+    } else if (shootNow && !this.localShootHeld) {
+      // Press edge: start the meter
+      L.startMeter(holder); // sets up m.green/orange etc from live game state
+      if (L.meter) {
+        this.localMeter = { ...L.meter, t: 0 };
+        L.meter = this.localMeter;
+      }
+    }
+    this.localShootHeld = shootNow;
+  }
+
+
+
+  _sendShotRel(result) {
+    this.link.send({ t: 'c', c: { k: 'shot_rel', s: 'away', result } });
+  }
+  _sendFtRel(result) {
+    this.link.send({ t: 'c', c: { k: 'ft_rel', s: 'away', result } });
   }
 }
 

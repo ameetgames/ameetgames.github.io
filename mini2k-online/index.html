@@ -133,7 +133,7 @@
       <label for="selQ">Quarter length
         <select id="selQ"><option value="5">5 minutes</option><option value="6">6 minutes</option><option value="8">8 minutes</option><option value="12" selected>12 minutes</option></select></label>
       <label for="selDiff">Difficulty
-        <select id="selDiff"><option value="rookie">Rookie</option><option value="pro" selected>Pro</option><option value="allstar">All-Star</option></select></label>
+        <select id="selDiff"><option value="easy">Super Easy</option><option value="rookie">Rookie</option><option value="pro" selected>Pro</option><option value="allstar">All-Star</option></select></label>
     </div>
     <div class="keys">
       <div class="krow"><b>Offense</b><div><span><kbd>WASD</kbd> move</span><span><kbd>Shift</kbd> sprint</span><span><kbd>Space</kbd> hold and release: shoot</span> <span><kbd>Space</kbd> tap: pump fake</span><span><kbd>E</kbd> pass</span><span><kbd>C</kbd> dribble move (with <kbd>Shift</kbd>: blow-by)</span><span><kbd>Q</kbd> alley-oop lob</span><span><kbd>R</kbd> pick and roll</span></div></div>
@@ -190,7 +190,7 @@
       <label for="onTeam">Your team<select id="onTeam"></select></label>
       <label for="onVia">Connect through<select id="onVia"><option value="server" hidden>Internet: room code (Mini2K server)</option><option value="ntfy" selected>Internet: room code (ntfy.sh)</option><option value="manual">Manual codes: copy and paste</option><option value="local">This computer: two tabs (test)</option></select></label>
       <label for="onQ">Quarter length (room creator picks)<select id="onQ"><option value="5">5 minutes</option><option value="6">6 minutes</option><option value="8">8 minutes</option><option value="12" selected>12 minutes</option></select></label>
-      <label for="onDiff">Meter difficulty (room creator picks)<select id="onDiff"><option value="rookie">Rookie</option><option value="pro" selected>Pro</option><option value="allstar">All-Star</option></select></label>
+      <label for="onDiff">Meter difficulty (room creator picks)<select id="onDiff"><option value="easy">Super Easy</option><option value="rookie">Rookie</option><option value="pro" selected>Pro</option><option value="allstar">All-Star</option></select></label>
     </div>
     <div class="row2" id="onChoose">
       <button id="btnHost">Create room</button>
@@ -1447,10 +1447,13 @@ import { distE, shotZone, segPoint } from '@@engine/court.js@@';
 import { chooseShotType } from '@@engine/model.js@@';
 
 export const DIFFICULTY = {
-  //            CPU shot +/-   CPU defender reaction (s)  CPU def speed   CPU steal rate   user green window   user passes picked off
-  rookie:  { aiShotMod: -0.05, aiReact: 0.30, aiDefSpeed: 0.90, aiSteal: 0.6, greenScale: 1.5, userIcpt: 0.7 },
-  pro:     { aiShotMod: 0.00, aiReact: 0.20, aiDefSpeed: 0.96, aiSteal: 1.0, greenScale: 1.0, userIcpt: 1.0 },
-  allstar: { aiShotMod: 0.02, aiReact: 0.13, aiDefSpeed: 1.00, aiSteal: 1.25, greenScale: 0.8, userIcpt: 1.2 },
+  //            CPU shot +/-   CPU defender reaction (s)  CPU def speed   CPU steal rate   user green / orange window   user passes picked off
+  // Rookie and Pro greens are 10% bigger than before (AR, 2026-11-19); All-Star unchanged.
+  // Super Easy: the original (pre-2K) green window size, `classicGreen`, with Rookie's CPU.
+  easy:    { aiShotMod: -0.05, aiReact: 0.30, aiDefSpeed: 0.90, aiSteal: 0.6, greenScale: 1.65, orangeScale: 1.5, userIcpt: 0.7, classicGreen: true },
+  rookie:  { aiShotMod: -0.05, aiReact: 0.30, aiDefSpeed: 0.90, aiSteal: 0.6, greenScale: 1.65, orangeScale: 1.5, userIcpt: 0.7 },
+  pro:     { aiShotMod: 0.00, aiReact: 0.20, aiDefSpeed: 0.96, aiSteal: 1.0, greenScale: 1.1, orangeScale: 1.0, userIcpt: 1.0 },
+  allstar: { aiShotMod: 0.02, aiReact: 0.13, aiDefSpeed: 1.00, aiSteal: 1.25, greenScale: 0.8, orangeScale: 0.8, userIcpt: 1.2 },
 };
 
 // Offensive spots, normalized so the offense attacks the RIGHT hoop (88.75, 25).
@@ -1502,6 +1505,16 @@ export function pickSpot(L, e) {
   }
 }
 
+/**
+ * Chance the screener pops out for a three instead of rolling: from his three-point rating and how
+ * often he shoots threes (his tendency). Non-shooting bigs almost always roll; stretch bigs pop about a
+ * third of the time. Rolled again on every pick, so it changes from play to play.
+ */
+export function popChance(L, e) {
+  const P = L.p(e.id), t3 = P.attrs.three_pt, rate = P.tendencies?.three_rate ?? 0;
+  return Math.max(0.02, Math.min(0.6, 0.02 + 0.9 * rate * Math.max(0, Math.min(1.2, (t3 - 50) / 40))));
+}
+
 /** Where a screener stands: beside the on-ball defender, square to the handler's path to the hoop. */
 function screenPoint(L, e, holder) {
   const d = L.matchOf(holder), hoop = L.hoopOf(e.side);
@@ -1525,7 +1538,18 @@ export function offBallTarget(L, e, dt) {
   if (e.screen > 0) {
     if (!holder || holder.side !== e.side || holder === e || (L.plan?.mode === 'drive' && e.screenSet > 0.5 && !e.called)) e.screen = 0.001;
     e.screen -= dt;
-    if (e.screen <= 0) { e.screen = 0; e.called = false; e.cut = 1.7; e.roll = true; e.spotT = Math.max(e.spotT, 2.5); }
+    if (e.screen <= 0) {
+      e.screen = 0; e.called = false;
+      if (L.rng.chance(popChance(L, e))) {
+        // pick and pop: a big who can shoot flares out to the nearest spot behind the arc
+        let best = null, bd = 1e9;
+        for (const k of ['wingA', 'wingB', 'top', 'slotA', 'slotB']) {
+          const t = L.N(e.side, ...SPOTS[k]), d = Math.hypot(t.x - e.x, t.y - e.y);
+          if (d < bd) { bd = d; best = k; }
+        }
+        e.spot = best; e.spotT = 4; e.roll = false; e.cut = 0; e.popT = L.time;
+      } else { e.cut = 1.7; e.roll = true; e.spotT = Math.max(e.spotT, 2.5); }
+    }
     else {
       const t = screenPoint(L, e, holder);
       const dd = Math.hypot(t.x - e.x, t.y - e.y);
@@ -1914,6 +1938,8 @@ const SCORE_HARD = 0.85 * 0.75;
 const DUNK_HARD = 0.8 * 0.75, DUNK_CONTEST = 0.31;
 /** Space held for less than this is a pump fake, not a shot. */
 export const TAP_FAKE = 0.14;
+/** C held sideways cycles through these (crossover in front, through the legs, behind the back, a shift). */
+const SIDE_MOVES = ['shift', 'crossover', 'between_legs', 'behind_back'];
 /** A timeout lasts this long (seconds); both coaches make substitutions during it, in when it ends. */
 export const TIMEOUT_SECS = 10;
 /** Usual offense/defense ratio of the positional rebound factors (keeps the offensive-rebound rate calibrated). */
@@ -1938,7 +1964,7 @@ const perceived = (input, t) => (input.hold > 0
 export class LiveGame {
   /**
    * @param data  buildIndex(...) result
-   * @param opts  { home, away, seed, rules, user:'home'|'away'|'both'|null, difficulty:'rookie'|'pro'|'allstar' }
+   * @param opts  { home, away, seed, rules, user:'home'|'away'|'both'|null, difficulty:'easy'|'rookie'|'pro'|'allstar' }
    *
    * Human players: `humans` lists the sides a person controls (one for a normal game, both for a
    * two-player game, none for a CPU demo). Each human side has its own context in `uc[side]`
@@ -1987,7 +2013,7 @@ export class LiveGame {
           side, slot, id, role: slot, x: 47, y: 25, vx: 0, vy: 0, dvx: 0, dvy: 0, fx: 1, fy: 0,
           trkx: 47, trky: 25, stun: 0, stealCd: 0, spot: null, spotT: 0, cut: 0, screen: 0, roll: false,
           sprinting: false, handsUp: false, oob: false,
-          pivot: false, faked: 0, fakeT: -9, bitT: -9, jumpT: -9,
+          pivot: false, dribbled: false, faked: 0, fakeT: -9, bitT: -9, jumpT: -9,
         });
       });
     }
@@ -2302,7 +2328,7 @@ export class LiveGame {
     this.bcT = 0; this.possT = 0;
     this.transition = (kind === 'defreb' || kind === 'steal') && !this.crossed;
     if (kind !== 'oreb') for (const e of this.ents[side]) { e.spot = null; e.cut = 0; e.screen = 0; e.roll = false; }
-    for (const e of this.all) { e.oob = false; e.handsUp = false; e.pivot = false; e.faked = 0; }
+    for (const e of this.all) { e.oob = false; e.handsUp = false; e.pivot = false; e.dribbled = false; e.faked = 0; }
     this.double = null; this.ftMeter = null; this.rebCtx = null;
     for (const me of this.humans) this.uc[me].ctrl = side === me ? holder : this.matchOf(holder);
     if (this.humans.length) this.needRelease = true;
@@ -2471,6 +2497,7 @@ export class LiveGame {
       return;
     }
     if (n < 0.01) return this.hold(e);
+    if (e === this.ball.holder) e.dribbled = true;          // moving with the ball = dribbling
     const v = this.maxSpeed(e, input.sprint);
     e.dvx = input.mx / n * v; e.dvy = input.my / n * v;
     e.sprinting = !!input.sprint;
@@ -2536,7 +2563,7 @@ export class LiveGame {
       f.dur = Math.max(0.3, k / 42);
     }
     b.holder = null; b.flight = f;
-    this.meter = null; this.windup = null; this.double = null; from.pivot = false;
+    this.meter = null; this.windup = null; this.double = null; from.pivot = false; from.dribbled = false;
     this.lastPass = { from, to, t: this.time };
     return false;
   }
@@ -2570,7 +2597,7 @@ export class LiveGame {
     };
     to.cut = 0; to.screen = 0; to.roll = false;
     b.holder = null; b.flight = f;
-    this.meter = null; this.windup = null; this.double = null; from.pivot = false;
+    this.meter = null; this.windup = null; this.double = null; from.pivot = false; from.dribbled = false;
     this.lastPass = { from, to, t: this.time };
     this.fxText('Alley-oop!', from.x, from.y - 8, '#f3d35a');
     if (this.isHuman(from.side)) this.stats.lobs = (this.stats.lobs ?? 0) + 1;
@@ -2702,7 +2729,7 @@ export class LiveGame {
     else {
       ux = input.mx / n; uy = input.my / n;
       const dot = (ux * hx + uy * hy) / hn;
-      kind = dot < -0.5 ? 'step_back' : dot > 0.6 ? 'spin' : (h.moves = (h.moves ?? 0) + 1) % 2 ? 'crossover' : 'between_legs';
+      kind = dot < -0.5 ? 'step_back' : dot > 0.6 ? 'spin' : SIDE_MOVES[(h.moves = (h.moves ?? 0) + 1) % SIDE_MOVES.length];
     }
     const A = this.p(h.id).attrs, dd = d ? distE(h, d) : 99;
     const D = d ? this.p(d.id).attrs : null;
@@ -2711,6 +2738,7 @@ export class LiveGame {
     const ok = this.rng.chance(p);
     const burst = ok && !!input.sprint && kind !== 'step_back' && kind !== 'hesitation';
     h.movesLate = this.time - (h.dmove?.at ?? -9) < 2 ? (h.movesLate ?? 0) + 1 : 0;   // chaining moves gets harder
+    h.dribbled = true;
     h.dmove = { kind, t: 0, dur: burst ? 0.55 : kind === 'step_back' ? 0.35 : 0.4, dx: ux, dy: uy, ok, burst, at: this.time };
     this.stats.moves = (this.stats.moves ?? 0) + 1;
     if (d && dd <= 7) {
@@ -2730,7 +2758,10 @@ export class LiveGame {
   /** A light tap on Space: fake the shot. He has picked up his dribble, so he can only pivot, pass or shoot. */
   pumpFake(h) {
     this.meter = null;
-    h.pivot = true; h.fakeT = this.time;
+    // Picking the ball up after dribbling ends the dribble (no double dribble): pivot, pass or shoot.
+    // A fake right after the catch, before any dribble, keeps it alive.
+    if (h.dribbled) h.pivot = true;
+    h.fakeT = this.time;
     this.fxText('Pump fake', h.x, h.y - 3.5, '#f3d35a');
     for (const d of this.ents[other(h.side)]) {
       if (d.stun > 0 || distE(d, h) > 5) continue;
@@ -2880,11 +2911,11 @@ export class LiveGame {
       half_court: 0.035,
     };
 
-    const diffScale = this.diff.greenScale;
+    const diffScale = this.diff.greenScale, orangeScale = this.diff.orangeScale ?? diffScale;
 
     // Calculate final green and orange window size
     let gSize = BASE_GREEN[loc] * ratingMult * energyMult * distMult * contestMult * hardAngle * diffScale;
-    let oSize = BASE_ORANGE[loc] * ratingMult * energyMult * distMult * contestMult * hardAngle * diffScale;
+    let oSize = BASE_ORANGE[loc] * ratingMult * energyMult * distMult * contestMult * hardAngle * orangeScale;
     // Enlarge orange bar for a more forgiving window
     oSize *= 1.2;
 
@@ -2897,6 +2928,10 @@ export class LiveGame {
     if (loc === 'deep_3' && c.score > 0.65) {
       gSize = 0;
     }
+
+    // Super Easy: the original green window (before the 2K-style meter), same size in seconds, at the top.
+    // Never smaller than Rookie's, so Super Easy is the easiest everywhere (the old window was small at the rim).
+    if (this.diff.classicGreen) gSize = Math.max(gSize, this.classicGreen(h, m, c.score, type, d));
 
     // Clamp green window
     if (gSize > 0) {
@@ -2917,6 +2952,22 @@ export class LiveGame {
     m.greenStart = gSize > 0 ? 1.0 - gSize : 1.05;
     m.greenEnd = gSize > 0 ? 1.01 : -1;
     m.orangeStart = oSize > 0 ? Math.max(0.08, m.greenStart - oSize) : m.greenStart;
+  }
+
+  /**
+   * The first meter's green window (v10, Pro): +-green around the sweet spot, as a share of the old
+   * meter time (rim 0.5 s, mid 0.72 s, three 0.8 s). Returned as a share of this meter's time.
+   */
+  classicGreen(h, m, score, type, d) {
+    const A = this.p(h.id).attrs;
+    const attr = type === 'three' ? A.three_pt : type === 'mid' ? A.mid_range : A.finishing;
+    const oldDur = type === 'rim' ? 0.5 : type === 'mid' ? 0.72 : 0.8;
+    const base = clamp(0.032 + 0.0007 * (attr - 50), 0.015, 0.09);
+    const deep = type === 'three' ? clamp(1 - (d - 24.5) / 8.5, 0.25, 1) : 1;
+    const hard = deep * (1 - 0.75 * (m.tough ?? 0));
+    const floor = Math.max(0.01, 0.6 / 60 / oldDur) * (hard < 0.95 ? 0.6 : 1);
+    const half = clamp(base * GREEN_SCALE * hard * (1.4 - 1.1 * score), floor, 0.11);
+    return (2 * half * oldDur) / m.dur;
   }
 
   calcOrangeProb(h, m) {
@@ -3025,7 +3076,7 @@ export class LiveGame {
       this.fxText(c.name, e.x, e.y - 6.5, c.color);
       if (ta.sev > 0.25) this.fxText('Tough angle', e.x, e.y - 9.5, '#ff9a3a');
     }
-    e.pivot = false;
+    e.pivot = false; e.dribbled = false;
     const dunkTry = zone.type === 'rim' && zone.dist < 6.6 && this.p(e.id).attrs.dunk >= 55;
     const makeScale = (dunkTry && c.score > DUNK_CONTEST ? DUNK_HARD : SCORE_HARD) * (1 - 0.35 * ta.behind);
     const lp = this.lastPass;
@@ -3092,7 +3143,7 @@ export class LiveGame {
     this.phase = 'anim';
     this.meter = null; this.windup = null; this.ball.flight = null; this.ftLine = null; this.passTarget = null;
     this.ftMeter = null; this.double = null;
-    for (const e of this.all) e.pivot = false;
+    for (const e of this.all) { e.pivot = false; e.dribbled = false; }
     this.pump();
   }
 
@@ -5746,6 +5797,91 @@ def('call_for_ball', 0.9, true, [
   [0.5, { lean: 4, aF: [176, -6], aB: [-10, 20], lF: [12, 14], lB: [-8, 14], lift: 1 }],
 ]);
 
+
+// ================================================================== batch 6: dribble moves with a visible ball and footwork
+// `bp` (ball path) puts the ball where the move shows it: [timeFraction, where, dx, behind]
+//   where: 'F' / 'B' / '2' hand anchors, 'fl' a bounce on the floor (dx pixels ahead of the feet),
+//   'hp' hip height (dx ahead); behind = 1 draws the ball behind the body (behind the back).
+// Moves played while the player is moving use a '~run' copy whose legs keep stepping, so nobody slides.
+def('crossover', 0.46, false, [
+  [0, { lean: 22, aF: [36, 36], aB: [-12, 30], lF: [30, 30], lB: [-20, 28], ball: 'F' }],
+  [0.3, { lean: 30, aF: [20, 20], aB: [20, 24], lF: [44, 46], lB: [-30, 30], dx: -1, ball: 'F' }],
+  [0.5, { lean: 30, aF: [8, 18], aB: [30, 24], lF: [40, 44], lB: [-26, 34], ball: 'F' }],
+  [0.7, { lean: 26, aF: [-6, 26], aB: [40, 30], lF: [16, 30], lB: [-30, 26], dx: 1, lift: 1, ball: 'B' }],
+  [1, { lean: 22, aF: [-10, 30], aB: [38, 36], lF: [30, 30], lB: [-20, 28], dx: 1, ball: 'B' }],
+], { bp: [[0, 'F'], [0.42, 'fl', 5], [0.7, 'B'], [1, 'B']] });
+def('between_legs', 0.5, false, [
+  [0, { lean: 22, aF: [34, 30], aB: [-14, 20], lF: [40, 40], lB: [-30, 30], ball: 'F' }],
+  [0.35, { lean: 32, aF: [14, 6], aB: [-4, 8], lF: [56, 58], lB: [-40, 34], ball: 'F' }],
+  [0.55, { lean: 32, aF: [6, 10], aB: [-10, 10], lF: [56, 58], lB: [-40, 34], ball: 'F' }],
+  [0.75, { lean: 26, aF: [10, 26], aB: [-22, 16], lF: [44, 46], lB: [-34, 30], ball: 'B' }],
+  [1, { lean: 20, aF: [20, 30], aB: [-26, 30], lF: [30, 34], lB: [-20, 28], ball: 'B' }],
+], { bp: [[0, 'F'], [0.48, 'fl', 1], [0.74, 'B'], [1, 'B']] });
+def('behind_back', 0.48, false, [
+  [0, { lean: 14, aF: [20, 24], aB: [-10, 20], lF: [30, 28], lB: [-20, 26], ball: 'F' }],
+  [0.3, { lean: 8, aF: [-40, -10], aB: [-20, 14], lF: [34, 30], lB: [-22, 26], ball: 'F' }],
+  [0.5, { lean: 8, aF: [-56, -20], aB: [-40, 0], lF: [30, 30], lB: [-24, 28], ball: 'F' }],
+  [0.72, { lean: 14, aF: [-10, 20], aB: [-30, 10], lF: [26, 28], lB: [-18, 26], ball: 'B' }],
+  [1, { lean: 18, aF: [16, 30], aB: [24, 40], lF: [28, 28], lB: [-18, 24], ball: 'B' }],
+], { bp: [[0, 'F'], [0.32, 'hp', -6, 1], [0.52, 'fl', -4, 1], [0.76, 'B'], [1, 'B']] });
+def('hesitation', 0.56, false, [
+  [0, { lean: 20, aF: [36, 38], aB: [-20, 30], lF: [34, 32], lB: [-22, 28], ball: 'F' }],
+  [0.25, { lean: 4, head: -8, aF: [34, 70], aB: [-10, 40], lF: [12, 10], lB: [-6, 10], lift: 1, ball: 'F' }],
+  [0.55, { lean: 2, head: -6, aF: [30, 74], aB: [-10, 40], lF: [10, 10], lB: [-6, 10], ball: 'F' }],
+  [0.75, { lean: 28, aF: [44, 30], aB: [-30, 40], lF: [46, 44], lB: [-30, 30], ball: 'F' }],
+  [1, { lean: 26, aF: [46, 30], aB: [-30, 40], lF: [34, 36], lB: [-24, 28], ball: 'F' }],
+], { bp: [[0, 'F'], [0.18, 'fl', 5], [0.38, 'F'], [0.62, 'fl', 5], [0.82, 'F'], [1, 'F']] });
+def('spin', 0.52, false, [
+  [0, { lean: 16, aF: [30, 60], aB: [34, 50], lF: [30, 30], lB: [-20, 30], ball: 'F' }],
+  [0.3, { lean: 10, aF: [24, 110], aB: [28, 100], lF: [14, 34], lB: [-8, 34], ball: '2', flip: true }],
+  [0.7, { lean: 10, aF: [24, 110], aB: [28, 100], lF: [-10, 34], lB: [16, 34], ball: '2', flip: true }],
+  [1, { lean: 18, aF: [36, 40], aB: [-10, 30], lF: [30, 30], lB: [-20, 28], ball: 'F' }],
+], { bp: [[0, 'F'], [0.2, 'fl', 4], [0.4, 'hp', 3], [0.65, 'hp', -3, 1], [0.85, 'fl', 4], [1, 'F']] });
+def('step_back', 0.5, false, [
+  [0, { lean: 18, aF: [36, 36], aB: [-14, 30], lF: [44, 30], lB: [-20, 34], ball: 'F' }],
+  [0.25, { lean: 14, aF: [30, 60], aB: [36, 56], lF: [46, 12], lB: [-10, 40], ball: 'F' }],
+  [0.55, { lean: -10, aF: [34, 80], aB: [40, 74], lF: [50, 6], lB: [-30, 44], lift: 3, dx: -3, ball: '2' }],
+  [1, { lean: -4, aF: [44, 86], aB: [50, 78], lF: [12, 26], lB: [-12, 26], dx: -4, ball: '2' }],
+], { bp: [[0, 'F'], [0.22, 'fl', 6], [0.45, '2'], [1, '2']] });
+def('shift', 0.42, false, [
+  [0, { lean: 20, aF: [36, 36], aB: [-20, 30], lF: [30, 30], lB: [-20, 28], ball: 'F' }],
+  [0.35, { lean: 24, aF: [30, 30], aB: [-24, 30], lF: [20, 20], lB: [-30, 34], lift: 3, dx: 1, ball: 'F' }],
+  [0.65, { lean: 28, aF: [40, 30], aB: [-24, 30], lF: [46, 46], lB: [-26, 30], dx: 1, ball: 'F' }],
+  [1, { lean: 22, aF: [36, 36], aB: [-20, 30], lF: [30, 32], lB: [-22, 28], ball: 'F' }],
+], { bp: [[0, 'F'], [0.3, 'fl', 6], [0.55, 'F'], [0.82, 'fl', 5], [1, 'F']] });
+
+/** Ball path from a move's hand changes: a bounce between hands (in front, through the legs or behind). */
+function autoPath(an) {
+  const kind = /tween|between/.test(an.name) ? [1, 0] : /behind|wrap|btb/.test(an.name) ? [-4, 1] : [5, 0];
+  const pts = [];
+  let prev = null;
+  for (const [t, p] of an.keys) {
+    const b = 'ball' in p ? p.ball : an.ball;
+    if (b !== 'F' && b !== 'B' && b !== '2') continue;
+    if (prev && prev.b !== b && prev.b !== '2' && b !== '2') pts.push([(prev.t + t) / 2, 'fl', kind[0], kind[1]]);
+    else if (prev && prev.b === b && b !== '2' && t - prev.t > 0.28) pts.push([(prev.t + t) / 2, 'fl', 5, 0]);   // keeps dribbling
+    pts.push([t, b]); prev = { t, b };
+  }
+  return pts.length > 1 ? pts : null;
+}
+export const DRIBBLE_MOVES = ['crossover', 'between_legs', 'behind_back', 'hesitation', 'spin', 'step_back', 'shift',
+  'in_and_out', 'double_cross', 'snatch_back', 'stutter_step', 'half_spin', 'push_cross', 'combo_cross_tween', 'combo_btb_cross',
+  'escape_retreat', 'drag_cross', 'hang_hesi', 'wrap_behind', 'spin_reverse', 'stepback_cross'];
+for (const n of DRIBBLE_MOVES) {
+  const an = A[n];
+  if (!an.bp) an.bp = autoPath(an);
+  // the moving version: same upper body, legs keep stepping (two steps), a little bounce
+  const keys = [];
+  for (let i = 0; i <= 8; i++) {
+    const u = i / 8, sp = samplePose(an, u * an.dur), ph = u * Math.PI * 2, sn = Math.sin(ph), cs = Math.cos(ph);
+    const k = { lean: Math.max(sp.lean, 12), head: sp.head, aF: sp.aF, aB: sp.aB, dx: sp.dx * 0.5, flip: sp.flip,
+      lF: [32 * sn, 10 + 40 * Math.max(0, cs)], lB: [-32 * sn, 10 + 40 * Math.max(0, -cs)], lift: sp.lift + 1.2 * Math.abs(sn) };
+    if (sp.ball === 'F' || sp.ball === 'B' || sp.ball === '2') k.ball = sp.ball;
+    keys.push([u, k]);
+  }
+  def(n + '~run', an.dur, false, keys, { bp: an.bp, ball: an.ball });
+}
+
 export const ANIMS = A;
 export const ANIM_GROUPS = {
   Locomotion: ['idle', 'idle_ball', 'idle_tired', 'walk', 'jog', 'sprint', 'backpedal', 'side_shuffle'],
@@ -6030,6 +6166,7 @@ export class Actors {
   cue(type, data = {}) { this.cues.push({ type, ...data }); }
 
   play(a, name, o = {}) {
+    if (ANIMS[name + '~run'] && a.spd > 4.5) name += '~run';   // dribble move on the move: the legs keep stepping
     const an = ANIMS[name];
     if (!an) return;
     a.one = { name, t: (o.from ?? 0) * an.dur, rate: o.rate ?? 1, dur: o.dur ?? an.dur, loop: an.loop, cancel: o.cancel ?? false, then: o.then ?? null, age: 0, driven: o.driven ?? null, lock: o.lock ?? false };
@@ -6429,7 +6566,7 @@ export class Actors {
       // dribble move called with C: play it now (a blow-by finishes with the burst)
       a.lastMove = e.dmove.at;
       if (L.time - e.dmove.at < 0.25) {
-        const dm = e.dmove, name = dm.kind === 'crossover' ? 'crossover' : dm.kind === 'between_legs' ? 'between_legs' : dm.kind === 'spin' ? 'spin' : dm.kind === 'step_back' ? 'step_back' : 'hesitation';
+        const dm = e.dmove, name = ANIMS[dm.kind] ? dm.kind : 'hesitation';
         a.left = dm.dx < 0;
         this.play(a, name, { cancel: false, then: dm.burst ? 'drive_burst' : null }); a.cd = 0.85; this.cue('squeak');
       }
@@ -6529,7 +6666,7 @@ export class Actors {
         if (mv) { this.play(a, mv, {}); a.cd = 0.85; this.cue('squeak'); }
       } else if (ps > 9.5 && spd < 3.5 && L.nearestDef(e).d < 9) {
         const dh = Math.hypot(hoop.x - x, hoop.y - y), h = hash(Math.floor(L.time * 7), e.slot, 43);
-        this.play(a, dh < 12 ? 'jump_stop' : pick(h, ['hesitation', 'stutter_step', 'hang_hesi']), {}); a.cd = 0.9; this.cue('squeak');
+        this.play(a, dh < 12 ? 'jump_stop' : pick(h, ['hesitation', 'stutter_step', 'hang_hesi', 'shift']), {}); a.cd = 0.9; this.cue('squeak');
       } else if (ps < 5.5 && spd > 10.5 && (a.vvx * (hoop.x - x) + a.vvy * (hoop.y - y)) > 0 && Math.hypot(hoop.x - x, hoop.y - y) < 32) {
         this.play(a, 'drive_burst', {}); a.cd = 0.7; this.cue('squeak');   // first step of a drive
       } else if (spd < 0.8 && a.catchT > 0.3 && a.catchT < 0.5 && !a.jab && L.nearestDef(e).d < 6.5) {
@@ -7010,8 +7147,26 @@ export class Broadcast {
       const a = carrier, f = a.frame;
       const [fx, fy] = this.actorScreen(a);
       const which = f.ball ?? '2';
-      let x, y;
-      if (which === 'drib') {
+      const path = ANIMS[a.cur]?.bp;
+      let x, y, behind = false;
+      if (path && carrier !== this.actors.byEnt.get(L.ftLine?.shooter)) {
+        // dribble move: the ball follows the move's path (hand to floor to the other hand, through the legs...)
+        const u = Math.max(0, Math.min(1, a.curT / ANIMS[a.cur].dur));
+        let i = 0;
+        while (i < path.length - 2 && path[i + 1][0] <= u) i++;
+        const p0 = path[i], p1 = path[Math.min(i + 1, path.length - 1)];
+        const span = p1[0] - p0[0], s0 = span > 0 ? Math.max(0, Math.min(1, (u - p0[0]) / span)) : 1;
+        const s = p1[1] === 'fl' ? s0 * s0 : p0[1] === 'fl' ? 1 - (1 - s0) * (1 - s0) : s0;   // falls, then rises
+        const at = (p) => {
+          if (p[1] === 'fl') return [fx + (p[2] ?? 4) * f.dir, fy - 3];
+          if (p[1] === 'hp') return [fx + f.hip[0] + (p[2] ?? 0) * f.dir, fy + f.hip[1] + 2];
+          const anc = this.bank.anchor(f, p[1]);
+          return [fx + anc[0] + (p[1] === '2' ? 0 : f.dir), fy + anc[1] - (p[1] === '2' ? 0 : 1)];
+        };
+        const q0 = at(p0), q1 = at(p1);
+        x = q0[0] + (q1[0] - q0[0]) * s; y = q0[1] + (q1[1] - q0[1]) * s;
+        behind = !!(p0[3] || (p1[3] && s0 > 0.5));   // only once the ball has gone round the hip
+      } else if (which === 'drib') {
         const an = ANIMS[a.cur], anc = f.handF;
         const per = a.cur === 'free_throw' ? 0.34 : an.dur;
         const k = Math.abs(Math.cos(Math.PI * (a.curT / per)));
@@ -7022,7 +7177,7 @@ export class Broadcast {
       }
       this.b1 = null;
       this.ballWorld = { x: a.x, y: a.y };
-      return { x, y, fx: x, fy: cam.sy(a.y) + 1, depth: a.y + 0.02, spin: Math.floor(a.curT * 9) };
+      return { x, y, fx: x, fy: cam.sy(a.y) + 1, depth: a.y + (behind ? -0.03 : 0.02), spin: Math.floor(a.curT * 9) };
     }
     // free ball
     let x = b.x, y = b.y, z = b.z;
@@ -8689,7 +8844,7 @@ speed = Math.max(0.25, Math.min(16, Number(params.get('speed') ?? 1) || 1));
 const pick = (k) => (teamIds.includes((params.get(k) ?? '').toUpperCase()) ? params.get(k).toUpperCase() : null);
 const seed = params.get('seed') ? Number(params.get('seed')) : undefined;
 const q = [5, 6, 8, 12].includes(Number(params.get('q'))) ? Number(params.get('q')) : 12;
-const diff = ['rookie', 'pro', 'allstar'].includes(params.get('diff')) ? params.get('diff') : 'pro';
+const diff = ['easy', 'rookie', 'pro', 'allstar'].includes(params.get('diff')) ? params.get('diff') : 'pro';
 if (params.get('demo')) {
   const home = pick('home') ?? teamIds[0];
   start({ home, away: pick('away') ?? teamIds.find((t) => t !== home), user: null, quarter: q, difficulty: diff, seed });

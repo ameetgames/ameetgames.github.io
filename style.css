@@ -15,3 +15,5 @@ h1 { text-align: center; margin-bottom: 8px; }
 .info { max-width: 900px; margin: 0 auto; }
 .info p { font-size: 17px; line-height: 1.5; }
 .info img { width: 100%; height: auto; border: 1px solid #ccc; border-radius: 6px; display: block; }
+footer { max-width: 900px; margin: 40px auto 0; padding: 16px; border-top: 1px solid #ddd; text-align: center; color: #666; font-size: 14px; }
+footer a { color: #444; }

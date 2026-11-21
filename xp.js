@@ -2,7 +2,7 @@
    Optional Google sign-in keeps a separate save per Google account (still in this browser). */
 (() => {
   // Paste your Google OAuth "Web application" client ID here to turn on the Sign in button.
-  const GOOGLE_CLIENT_ID = '';
+  const GOOGLE_CLIENT_ID = '892130939149-gjr6cia4pvrrktgsl6r784p4jscelm0o.apps.googleusercontent.com';
 
   const STREAK_XP = [50, 100, 200, 400];            // day 1, 2, 3, 4+ of a streak
   const TRY_REWARDS = {

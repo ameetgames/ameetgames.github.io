@@ -24,3 +24,8 @@ footer a { color: #444; }
   nav a { font-size: 14px; margin-right: 14px; }
   .subtitle { font-size: 14px; }
 }
+.legal h2 { font-size: 20px; margin: 28px 0 8px; }
+.legal p, .legal li { font-size: 15px; line-height: 1.6; }
+.legal .updated { color: #777; font-size: 13px; text-align: center; margin-top: 0; }
+.legal a { color: #1d4ed8; }
+footer br + a, footer a + a { margin-top: 6px; }

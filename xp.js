@@ -348,7 +348,7 @@
       delete state.profiles.guest;
     }
     state.current = id;
-    Object.assign(state.profiles[id], { name: info.name || info.given_name || info.email || '', picture: info.picture || '' });
+    Object.assign(state.profiles[id], { name: info.name || info.given_name || '', picture: info.picture || '' });
     save();
     renderHud();
     decorateCards();
@@ -371,7 +371,7 @@
     s.onload = () => {
       tokenClient = google.accounts.oauth2.initTokenClient({
         client_id: GOOGLE_CLIENT_ID,
-        scope: 'openid profile email',
+        scope: 'openid profile',
         callback: async resp => {
           if (!resp || !resp.access_token) return;
           try {

@@ -1,0 +1,105 @@
+rules_version = '2';
+
+// Ameet Games: security rules for the online XP save and leaderboard.
+// Paste this whole file into Firebase console > Firestore Database > Rules, then Publish.
+//
+// Every write is checked here, on Google's servers, so players can't type in fake points:
+//   - the daily streak reward can be claimed once per day (checked against Google's clock)
+//   - each "try a game" reward can be claimed once, ever
+//   - the name and picture must be the player's own Google first name and photo
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{uid} {
+      allow read: if true;   // public leaderboard (hidden players have no name or photo stored)
+
+      allow create: if isOwner(uid)
+        && hasFields(request.resource.data)
+        && validProfile(request.resource.data)
+        && request.resource.data.xp == 0
+        && request.resource.data.streak == 0
+        && request.resource.data.lastDay == ''
+        && request.resource.data.tried.size() == 0;
+
+      allow update: if isOwner(uid)
+        && hasFields(request.resource.data)
+        && validProfile(request.resource.data)
+        && (profileChange() || streakClaim() || tryClaim());
+
+      allow delete: if isOwner(uid);
+    }
+
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function hasFields(d) {
+      return d.keys().hasOnly(['name', 'photo', 'hidden', 'xp', 'streak', 'lastDay', 'tried'])
+        && d.keys().hasAll(['name', 'photo', 'hidden', 'xp', 'streak', 'lastDay', 'tried']);
+    }
+
+    function firstName() {
+      return request.auth.token.get('name', '').split(' ')[0];
+    }
+
+    function validProfile(d) {
+      return d.hidden is bool
+        && d.name is string && d.photo is string
+        && d.xp is int && d.xp >= 0
+        && d.streak is int && d.streak >= 0
+        && d.lastDay is string
+        && d.tried is map
+        && (d.hidden
+              ? (d.name == '' && d.photo == '')
+              : ((d.name == '' || d.name == firstName())
+                 && (d.photo == '' || d.photo == request.auth.token.get('picture', ''))));
+    }
+
+    // Only name / photo / hidden change; points stay the same.
+    function profileChange() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'photo', 'hidden']);
+    }
+
+    // ---- daily streak ----
+    function isDay(d) {
+      return d is string && d.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+    function dayStart(d) {
+      return timestamp.date(int(d[0:4]), int(d[5:7]), int(d[8:10]));
+    }
+    function streakXp(s) {
+      return s == 1 ? 50 : (s == 2 ? 100 : (s == 3 ? 200 : 400));
+    }
+    function streakClaim() {
+      let o = resource.data;
+      let n = request.resource.data;
+      // The player's local calendar day must be "today" somewhere on Earth right now
+      // (time zones run from UTC-12 to UTC+14).
+      return n.diff(o).affectedKeys().hasOnly(['xp', 'streak', 'lastDay'])
+        && isDay(n.lastDay)
+        && request.time >= dayStart(n.lastDay) - duration.value(14, 'h')
+        && request.time < dayStart(n.lastDay) + duration.value(36, 'h')
+        && (o.lastDay == '' || dayStart(n.lastDay) > dayStart(o.lastDay))
+        && n.streak == ((o.lastDay != '' && dayStart(n.lastDay) == dayStart(o.lastDay) + duration.value(1, 'd'))
+                          ? o.streak + 1 : 1)
+        && n.xp == o.xp + streakXp(n.streak);
+    }
+
+    // ---- try a game (once each) ----
+    function tryClaim() {
+      let o = resource.data;
+      let n = request.resource.data;
+      let t = n.tried.diff(o.tried);
+      return n.diff(o).affectedKeys().hasOnly(['xp', 'tried'])
+        && t.removedKeys().size() == 0
+        && t.changedKeys().size() == 0
+        && t.addedKeys().size() > 0
+        && t.addedKeys().hasOnly(['minislam', 'minisoccer'])
+        && (!t.addedKeys().hasAny(['minislam']) || n.tried.minislam == true)
+        && (!t.addedKeys().hasAny(['minisoccer']) || n.tried.minisoccer == true)
+        && n.xp == o.xp
+             + (t.addedKeys().hasAny(['minislam']) ? 50 : 0)
+             + (t.addedKeys().hasAny(['minisoccer']) ? 25 : 0);
+    }
+  }
+}

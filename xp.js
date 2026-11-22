@@ -3,7 +3,14 @@
    Every online point is checked by the Firebase security rules in firestore.rules. */
 
 // Paste the config from Firebase console > Project settings > Your apps > Web app here.
-const FIREBASE_CONFIG = null;
+const FIREBASE_CONFIG = {
+  apiKey: 'AIzaSyDfmOGHTjMqAx26OWY5QOB63I281TNNGTM',
+  authDomain: 'ameetgames.firebaseapp.com',
+  projectId: 'ameetgames',
+  storageBucket: 'ameetgames.firebasestorage.app',
+  messagingSenderId: '892130939149',
+  appId: '1:892130939149:web:a740f3b42d7f10daabe044',
+};
 
 const FIREBASE_VERSION = '13.1.0';
 const STREAK_XP = [50, 100, 200, 400];            // day 1, 2, 3, 4+ of a streak

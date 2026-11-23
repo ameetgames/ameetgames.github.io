@@ -12,6 +12,7 @@ h1 { text-align: center; margin-bottom: 8px; }
 .game img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border: 1px solid #ccc; border-radius: 6px; display: block; }
 .game span { display: block; margin-top: 8px; font-size: 20px; font-weight: bold; }
 .new { color: #d00; font-style: normal; }
+.beta { color: #16a34a; font-style: normal; }
 .game:hover span { text-decoration: underline; }
 .info { max-width: 900px; margin: 0 auto; }
 .info p { font-size: 17px; line-height: 1.5; }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-zAnUpI9IP29RCYB+KAVD8nY0xAFD4Y+6q7etDt4X3U0='; style-src 'sha256-5sMBF+4aMguvdF6SyL2+n2wnfn53gm69bRjjcSisRbo='; img-src data:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Ny4YpQ09VSFfw+ZmL9iMEA538nQb7qq4OfpOFooMxog='; style-src 'sha256-scddC0x4qYz4vvgk8U/vidAoOtzXHk8iGCM9M5PUvuo='; img-src data:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#0b0221">
 <meta name="description" content="Beat the Reveal: a daily trivia game. Five clues, one guess. Lock in now, or pay for one more clue?">
@@ -459,13 +459,9 @@ html[data-theme="day"] .clock .ring-bg { stroke: rgba(34, 16, 63, .15); }
 .field input { width: 100%; font-size: 18px; padding: 15px 14px; min-height: 54px; border-radius: 8px; border: 2px solid var(--pink);
   background: var(--panel-solid); color: var(--text); box-shadow: var(--gl-pink-box); outline: none; }
 .field input:focus { border-color: var(--cyan); box-shadow: var(--gl-cyan-box); }
-.field input.ok { border-color: var(--green); }
-.sugg { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 4px; }
-.sugg li button { width: 100%; text-align: left; min-height: 44px; padding: 10px 12px; font-size: 16px; border: 2px solid var(--line);
-  background: var(--panel); border-radius: 6px; color: var(--text); }
-.sugg li button:hover, .sugg li button[aria-selected="true"] { border-color: var(--cyan); background: var(--panel2); box-shadow: var(--gl-cyan-box); }
-.sugg mark { background: none; color: var(--cyan); font-weight: 700; }
-.gmsg { min-height: 1.4em; font-size: 13px; color: var(--mute); text-align: left; margin: 0; }
+.gmsg { min-height: 1.5em; font-size: 14px; color: var(--mute); text-align: left; margin: 6px 0 0; }
+.gmsg.fix { color: var(--cyan); font-weight: 600; }
+.gmsg.warn { color: var(--orange); font-weight: 600; }
 .guess .gh .l { flex: 1; min-width: 0; font-size: 10px; }
 .guess .gh .p { flex: none; }
 .play.guessing .play-top { order: -3; }
@@ -860,7 +856,7 @@ function unseal(n, bank) {
   return p;
 }
 
-/* ---------- Answers: normalisation and autocomplete over the closed list ---------- */
+/* ---------- Answers: normalisation and the closed list ---------- */
 function norm(s) {
   s = String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
   s = s.replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -868,30 +864,72 @@ function norm(s) {
 }
 const ANSWERS = DATA.answers.map((a) => ({ id: a[0], text: a[1], primary: a[2] === 1, key: norm(a[1]) }));
 const KEYMAP = new Map();
-for (const a of ANSWERS) if (!KEYMAP.has(a.key)) KEYMAP.set(a.key, a);
+for (const a of ANSWERS) if (!KEYMAP.has(a.key) || (a.primary && !KEYMAP.get(a.key).primary)) KEYMAP.set(a.key, a);
 function exactEntry(text) {
   const k = norm(text);
   return k ? KEYMAP.get(k) || null : null;
 }
-function suggest(q, max) {
-  const k = norm(q);
-  if (k.length < 2) return [];
-  const best = new Map();
-  for (const a of ANSWERS) {
-    let s = -1;
-    if (a.key.startsWith(k)) s = 0;
-    else if (a.key.indexOf(' ' + k) >= 0) s = 1;
-    else if (k.length >= 3 && a.key.indexOf(k) >= 0) s = 2;
-    if (s < 0) continue;
-    const cur = best.get(a.id);
-    const better = !cur || s < cur.s || (s === cur.s && a.primary && !cur.a.primary) ||
-      (s === cur.s && a.primary === cur.a.primary && a.text.length < cur.a.text.length);
-    if (better) best.set(a.id, { a, s });
+/* ---------- Guessing: free typing, autocorrected to the closest answer we know ----------
+   There are no suggestions. Whatever you type is matched against the whole closed list (every puzzle's
+   answers and alternates plus decoys). The closest entry wins, and that entry is your guess, even when it
+   is not this puzzle's answer: "Odyhsey" becomes "Odyssey" whatever the puzzle is. The matcher never looks
+   at the puzzle's answer. If nothing is close, the guess stays as typed and counts as a miss. */
+
+// Optimal string alignment distance (insert, delete, substitute, swap two neighbours), giving up past `max`.
+function osa(a, b, max) {
+  const n = a.length, m = b.length;
+  if (Math.abs(n - m) > max) return max + 1;
+  let prev2 = null;
+  let prev = new Array(m + 1);
+  for (let j = 0; j <= m; j++) prev[j] = j;
+  for (let i = 1; i <= n; i++) {
+    const cur = new Array(m + 1);
+    cur[0] = i;
+    let rowMin = i;
+    for (let j = 1; j <= m; j++) {
+      const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+      let v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (i > 1 && j > 1 && a.charCodeAt(i - 1) === b.charCodeAt(j - 2) && a.charCodeAt(i - 2) === b.charCodeAt(j - 1)) v = Math.min(v, prev2[j - 2] + 1);
+      cur[j] = v;
+      if (v < rowMin) rowMin = v;
+    }
+    if (rowMin > max) return max + 1;
+    prev2 = prev;
+    prev = cur;
   }
-  return [...best.values()]
-    .sort((x, y) => x.s - y.s || x.a.key.length - y.a.key.length || (x.a.key < y.a.key ? -1 : 1))
-    .slice(0, max || 6)
-    .map((e) => e.a);
+  return prev[m];
+}
+// How many edits still count as "a misspelling": about a quarter of the length, at least 1, at most 4.
+const fuzzLimit = (a, b) => clamp(Math.floor(Math.max(a.length, b.length) / 4), 1, 4);
+
+/* Returns null for empty text, otherwise { id, text, typed, fixed, none }.
+   id/text: the entry your guess became (id is null when nothing was close, text is then what you typed).
+   fixed: the text was autocorrected to a different spelling. */
+function resolveGuess(raw) {
+  const typed = String(raw).replace(/\s+/g, ' ').trim();
+  const k = norm(typed);
+  if (!k) return null;
+  const exact = KEYMAP.get(k);
+  if (exact) return { id: exact.id, text: exact.text, typed, fixed: false, none: false };
+  let best = null;
+  for (const a of ANSWERS) {
+    const lim = fuzzLimit(k, a.key);
+    if (Math.abs(a.key.length - k.length) > lim) continue;
+    const d = osa(k, a.key, lim);
+    if (d > lim) continue;
+    // closest wins; ties go to the proportionally closer one, then the primary spelling, then the shorter, then alphabetical
+    const rank = [d, d / Math.max(k.length, a.key.length), a.primary ? 0 : 1, a.key.length, a.key];
+    let better = !best;
+    if (best) {
+      for (let i = 0; i < rank.length; i++) {
+        if (rank[i] < best.rank[i]) { better = true; break; }
+        if (rank[i] > best.rank[i]) break;
+      }
+    }
+    if (better) best = { a, rank };
+  }
+  if (!best) return { id: null, text: typed, typed, fixed: false, none: true };
+  return { id: best.a.id, text: best.a.text, typed, fixed: true, none: false };
 }
 
 /* ---------- Storage ---------- */
@@ -1537,6 +1575,8 @@ class Run {
     this.auto = !!r.auto;             // ended by the automatic lock at clue 5
     this.outcome = r.outcome || null; // correct | wrong | gave_up
     this.guessId = r.guessId || null;
+    this.gt = r.gt || '';             // the answer your guess became (or the text as typed, when nothing was close)
+    this.ty = r.ty || '';             // what you actually typed, only when it was autocorrected
     this.points = r.points || 0;
     this.near = !!r.near;             // wrong, but on the puzzle's "prompt" list
     this.ts = r.ts || 0;
@@ -1549,6 +1589,7 @@ class Run {
     if (this.state === 'locked') o.auto = this.auto;
     if (this.state === 'done') {
       o.outcome = this.outcome; o.guessId = this.guessId; o.points = this.points;
+      o.gt = this.gt; o.ty = this.ty;
       o.auto = this.auto; o.near = this.near; o.ts = this.ts;
     }
     if (this.party) o.party = this.party;
@@ -1607,10 +1648,13 @@ class Run {
     if (this.party) this.party.locks = this.party.locks.map((x) => (x == null ? this.k : x));
     this.finish('gave_up', null, false);
   }
-  guess(entry) {
-    const ok = entry.id === this.p.answer.id;
-    const near = !ok && (this.p.answer.promptIds || []).indexOf(entry.id) >= 0;
-    this.finish(ok ? 'correct' : 'wrong', entry.id, near);
+  /* res comes from resolveGuess(): the closest known answer to what was typed (id null if nothing was close). */
+  guess(res) {
+    const ok = res.id !== null && res.id === this.p.answer.id;
+    const near = !ok && res.id !== null && (this.p.answer.promptIds || []).indexOf(res.id) >= 0;
+    this.gt = res.text;
+    this.ty = res.fixed ? res.typed : '';
+    this.finish(ok ? 'correct' : 'wrong', res.id, near);
   }
   finish(outcome, guessId, near) {
     this.state = 'done';
@@ -2172,61 +2216,39 @@ function watcherLock(i, btn) {
   announce(n + (n === 1 ? ' watcher has' : ' watchers have') + ' locked in.');
 }
 
-/* ---------- Guess panel with autocomplete from the closed list ---------- */
+/* ---------- Guess panel: just type it. Close misspellings are autocorrected (see resolveGuess) ---------- */
 function makeGuessField(onChange, onEnter) {
-  const listId = 'sg' + (++modalSeq);
-  const input = h('input', { type: 'text', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', role: 'combobox',
-    'aria-autocomplete': 'list', 'aria-expanded': 'false', 'aria-controls': listId, 'aria-label': 'Your answer', placeholder: 'Type your answer', maxlength: '60', enterkeyhint: 'go' });
-  const list = h('ul', { class: 'sugg', id: listId, role: 'listbox', 'aria-label': 'Suggestions' });
+  const input = h('input', { type: 'text', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
+    'aria-label': 'Your answer', placeholder: 'Type your answer', maxlength: '60', enterkeyhint: 'go' });
   const msg = h('p', { class: 'gmsg', role: 'status' });
-  const f = { items: [], active: -1, entry: null };
-  function highlight(text, q) {
-    const i = q ? text.toLowerCase().indexOf(q.trim().toLowerCase()) : -1;
-    if (i < 0) return [text];
-    return [text.slice(0, i), h('mark', { text: text.slice(i, i + q.trim().length) }), text.slice(i + q.trim().length)];
-  }
-  function render() {
-    list.replaceChildren();
-    f.items.forEach((a, i) => {
-      list.append(h('li', { role: 'presentation' },
-        h('button', { type: 'button', role: 'option', id: listId + '-' + i, 'aria-selected': String(i === f.active), tabindex: '-1', onclick: () => choose(a) }, highlight(a.text, input.value))));
-    });
-    input.setAttribute('aria-expanded', String(f.items.length > 0));
-    input.classList.toggle('ok', !!f.entry);
-    if (!input.value.trim()) msg.textContent = '';
-    else if (f.entry) msg.textContent = 'Locked and loaded. Hit submit.';
-    else msg.textContent = 'Pick an answer from the list.';
-  }
-  function choose(a) {
-    input.value = a.text;
-    f.entry = a;
-    f.items = [];
-    f.active = -1;
-    render();
-    onChange(a);
-    input.focus();
+  let timer = 0;
+  // A quiet note once you pause typing: only when autocorrect will change your text, or nothing is close. No options are listed.
+  function hint() {
+    const r = resolveGuess(input.value);
+    msg.className = 'gmsg';
+    msg.textContent = '';
+    if (!r) return;
+    if (r.fixed) { msg.textContent = 'Autocorrects to: ' + r.text; msg.classList.add('fix'); }
+    else if (r.none && norm(input.value).length >= 3) { msg.textContent = 'Nothing close to that. As typed, it will count as a miss.'; msg.classList.add('warn'); }
   }
   input.addEventListener('input', () => {
-    f.entry = exactEntry(input.value);
-    f.items = suggest(input.value, 6);
-    f.active = -1;
-    render();
-    onChange(f.entry);
+    onChange(!!norm(input.value));
+    clearTimeout(timer);
+    msg.className = 'gmsg';
+    msg.textContent = '';
+    timer = setTimeout(hint, 350);
   });
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowDown' && f.items.length) { e.preventDefault(); f.active = (f.active + 1) % f.items.length; render(); }
-    else if (e.key === 'ArrowUp' && f.items.length) { e.preventDefault(); f.active = (f.active - 1 + f.items.length) % f.items.length; render(); }
-    else if (e.key === 'Enter') {
+    if (e.key === 'Enter') {
       e.preventDefault();
-      if (f.active >= 0 && f.items[f.active]) choose(f.items[f.active]);
-      else if (f.entry) onEnter(f.entry);
-    } else if (e.key === 'Escape' && f.items.length) { e.stopPropagation(); f.items = []; f.active = -1; render(); }
-    if (f.active >= 0) input.setAttribute('aria-activedescendant', listId + '-' + f.active); else input.removeAttribute('aria-activedescendant');
+      const r = resolveGuess(input.value);
+      if (r) onEnter(r);
+    }
   });
   return {
-    el: h('div', { class: 'field' }, input, list, msg), input,
-    get entry() { return f.entry; },
-    clear() { input.value = ''; f.entry = null; f.items = []; f.active = -1; render(); onChange(null); },
+    el: h('div', { class: 'field' }, input, msg), input,
+    resolve() { return resolveGuess(input.value); },
+    clear() { clearTimeout(timer); input.value = ''; msg.className = 'gmsg'; msg.textContent = ''; onChange(false); },
   };
 }
 
@@ -2244,13 +2266,16 @@ function showGuess(cfg) {
     h('div', { class: 'l px' }, who + 'LOCKED AT CLUE ' + k, h('br'), 'ONE GUESS. MAKE IT COUNT.'),
     h('div', { class: 'p px', 'aria-label': LADDER[k - 1] + ' points', text: String(LADDER[k - 1]) }));
   const submit = h('button', { class: 'btn', type: 'button', disabled: true, text: 'SUBMIT GUESS' });
-  const doSubmit = (entry) => {
-    if (!entry) return;
+  let submitted = false;
+  // res = what the typed text became after autocorrect (see resolveGuess)
+  const doSubmit = (res) => {
+    if (!res || submitted) return;
+    submitted = true;
     submit.disabled = true;
-    if (cfg.onSubmit) cfg.onSubmit(entry); else { cur.guess(entry); afterGuess(); }
+    if (cfg.onSubmit) cfg.onSubmit(res); else { cur.guess(res); afterGuess(); }
   };
-  const field = makeGuessField((e) => { submit.disabled = !e; }, doSubmit);
-  submit.addEventListener('click', () => doSubmit(field.entry));
+  const field = makeGuessField((hasText) => { submit.disabled = !hasText; }, doSubmit);
+  submit.addEventListener('click', () => doSubmit(field.resolve()));
   const giveUp = cfg.onGiveUp ? () => cfg.onGiveUp() : confirmGiveUp;
   c.append(h('div', { class: 'guess' }, head, field.el, submit, h('div', { class: 'under' }, h('button', { class: 'link', type: 'button', onclick: giveUp, text: 'Give up' }))));
   ui.field = field;
@@ -2264,6 +2289,8 @@ function showGuess(cfg) {
 const ANS_BY_ID = new Map();
 for (const a of ANSWERS) if (!ANS_BY_ID.has(a.id) || a.primary) ANS_BY_ID.set(a.id, a);
 const answerText = (id) => (ANS_BY_ID.get(id) || { text: '?' }).text;
+// The text a guess became after autocorrect (falls back to the list entry for older saved games).
+const guessText = (g) => g.gt || answerText(g.guessId);
 
 /* ---------- Starting ---------- */
 function startToday(n) {
@@ -2354,7 +2381,13 @@ function buildResult(run) {
   R.verdict = h('div', { class: 'verdict px ' + vCls, text: vText });
   R.score = h('div', { class: 'scoreline px' }, '+', h('b', { text: String(run.points) }), ' / 100');
   const quip = [h('p', { class: 'quip', text: quipFor(run) })];
-  if (run.outcome === 'wrong' && run.guessId) quip.push(h('p', { class: 'alts' }, 'You guessed: ', h('span', { class: 'sofar', text: answerText(run.guessId) })));
+  if (run.outcome === 'wrong' && (run.gt || run.guessId)) {
+    quip.push(run.ty
+      ? h('p', { class: 'alts' }, 'You typed “' + run.ty + '”, which autocorrected to ', h('span', { class: 'sofar', text: guessText(run) }))
+      : h('p', { class: 'alts' }, 'You guessed: ', h('span', { class: 'sofar', text: guessText(run) })));
+  } else if (run.outcome === 'correct' && run.ty) {
+    quip.push(h('p', { class: 'alts' }, 'You typed “' + run.ty + '”, autocorrected to ', h('span', { class: 'sofar', text: guessText(run) })));
+  }
   if (run.auto && run.mode !== 'replay') quip.push(h('p', { class: 'alts', text: 'Out of clues, out of time. Locked at 20.' }));
   if (run.mode === 'practice' && run.bank === 'd' && run.outcome === 'correct') {
     const onTime = DB.days[run.n] && DB.days[run.n].state === 'done' && DB.days[run.n].outcome === 'correct';
@@ -2439,21 +2472,22 @@ function partyNext() {
   Sfx.play('pass');
   showPrivacy(p.names[i], () => {
     const j = p.locks[i] != null ? p.locks[i] : cur.k;
-    const record = (outcome, guessId) => {
-      p.res.push({ name: p.names[i], k: j, guessId: guessId || null, outcome, points: outcome === 'correct' ? LADDER[j - 1] : 0 });
+    const record = (outcome, res) => {
+      p.res.push({ name: p.names[i], k: j, guessId: res ? res.id : null, gt: res ? res.text : '', ty: res && res.fixed ? res.typed : '',
+        outcome, points: outcome === 'correct' ? LADDER[j - 1] : 0 });
       cur.save();
       if (ui.field) ui.field.clear();
       partyNext();
     };
     showGuess({
       who: p.names[i], k: j,
-      onSubmit: (entry) => record(entry.id === cur.p.answer.id ? 'correct' : 'wrong', entry.id),
+      onSubmit: (res) => record(res.id !== null && res.id === cur.p.answer.id ? 'correct' : 'wrong', res),
       onGiveUp: () => confirmModal('FOLD?', p.names[i] + ' will score 0.', 'FOLD IT', 'KEEP PLAYING', () => record('gave_up', null), 'cyan'),
     });
   });
 }
 function partyRows(run) {
-  const rows = [{ name: 'DRIVER', k: run.k, outcome: run.outcome, points: run.points, guessId: run.guessId, driver: true }];
+  const rows = [{ name: 'DRIVER', k: run.k, outcome: run.outcome, points: run.points, guessId: run.guessId, gt: run.gt, driver: true }];
   run.party.res.forEach((r) => rows.push(r));
   return rows;
 }
@@ -2484,7 +2518,7 @@ function showPartyResults() {
     tbody.append(h('tr', { class: isWin ? 'win' : '' },
       h('td', { text: (isWin ? '★ ' : '') + (r.driver ? 'Driver' : r.name) }),
       h('td', { text: 'clue ' + r.k }),
-      h('td', { text: r.outcome === 'correct' ? answerText(r.guessId) : r.outcome === 'gave_up' ? 'Folded' : answerText(r.guessId) + ' ✗' }),
+      h('td', { text: r.outcome === 'correct' ? guessText(r) : r.outcome === 'gave_up' ? 'Folded' : guessText(r) + ' ✗' }),
       h('td', { class: 'pts', text: String(r.points) })));
   });
   const table = h('table', { class: 'ptable' }, h('thead', null, h('tr', null, h('th', { text: 'PLAYER' }), h('th', { text: 'LOCKED' }), h('th', { text: 'GUESS' }), h('th', { class: 'pts', text: 'PTS' }))), tbody);
@@ -2810,7 +2844,7 @@ function openHowTo() {
         h('li', null, h('span', null, h('b', { text: 'Read the clue. ' }), 'Clue 1 is free and worth 100 points. Every extra clue costs 20.')),
         h('li', null, h('span', null, h('b', { text: 'Lock in, or pay. ' }), 'Sure of it? LOCK IN (tap twice). Not yet? NEXT CLUE. Neither is undoable.')),
         h('li', null, h('span', null, h('b', { text: 'Beat the clock. ' }), 'Each clue has a countdown. At zero the next clue bursts open for you, and the cost is the same 20.')),
-        h('li', null, h('span', null, h('b', { text: 'One guess. ' }), 'After you lock in, pick your answer from the list. Right scores the points. Wrong scores zero.'))),
+        h('li', null, h('span', null, h('b', { text: 'One guess. ' }), 'After you lock in, just type your answer. A close misspelling is autocorrected to the nearest answer we know, even if that turns out to be a different one. Right scores the points. Wrong scores zero.'))),
       h('p', { class: 'about-small', text: 'Keys: N or → next clue, L lock in, Enter submit, Esc cancel, ? help. You can slow the clock or turn it off in Settings. Add watchers on the home screen to decide together.' }),
     ],
     actions: [{ label: "LET'S GO" }],
@@ -3174,8 +3208,29 @@ function runSelfTest() {
   }
   ok('T10: share text never leaks answers or clues', !leak);
   // Answers
-  ok('answers: "everest" suggests Mount Everest', suggest('everest').some((a) => a.id === unseal(47).answer.id));
-  ok('answers: closed list rejects gibberish', exactEntry('zzqxj') === null);
+  ok('answers: gibberish is not in the closed list', exactEntry('zzqxj') === null);
+  // Autocorrect: free typing, snapped to the closest known answer (never to "the right one" on purpose)
+  const frank = unseal(2);                                   // Frankenstein
+  const odyId = exactEntry('The Odyssey').id;
+  const ody = resolveGuess('Odyhsey');
+  ok('autocorrect: "Odyhsey" becomes Odyssey', ody && ody.fixed && ody.id === odyId);
+  const fr = resolveGuess('Frankenstine');
+  ok('autocorrect: "Frankenstine" becomes Frankenstein', fr && fr.fixed && fr.id === frank.answer.id);
+  const onFrank = new Run(2, 'practice'); onFrank.begin(); onFrank.pay(false, 3000); onFrank.lock(false, 3000); onFrank.guess(resolveGuess('Odyhsey'));
+  ok('autocorrect: on the Frankenstein puzzle, "Odyhsey" is a wrong guess read as Odyssey', onFrank.outcome === 'wrong' && onFrank.gt === 'The Odyssey' && onFrank.ty === 'Odyhsey');
+  const onFrank2 = new Run(2, 'practice'); onFrank2.begin(); onFrank2.lock(false, 3000); onFrank2.guess(resolveGuess('Frankenstine'));
+  ok('autocorrect: "Frankenstine" scores as correct (100 at clue 1)', onFrank2.outcome === 'correct' && onFrank2.points === 100);
+  ok('autocorrect: swapped letters ("Zues") become Zeus', resolveGuess('Zues').id === exactEntry('Zeus').id);
+  ok('autocorrect: a typo in a longer title ("Mount Everst") is fixed', resolveGuess('Mount Everst').id === unseal(47).answer.id);
+  ok('autocorrect: "everest" matches Mount Everest exactly', resolveGuess('everest').id === unseal(47).answer.id && !resolveGuess('everest').fixed);
+  const none = resolveGuess('zzqxj');
+  ok('autocorrect: nothing close stays as typed and counts as a miss', none && none.none && none.id === null && none.text === 'zzqxj');
+  const missRun = new Run(2, 'practice'); missRun.begin(); missRun.lock(false, 1000); missRun.guess(none);
+  ok('autocorrect: a no-match guess scores zero', missRun.outcome === 'wrong' && missRun.points === 0);
+  ok('autocorrect: empty text is not a guess', resolveGuess('   ') === null);
+  let t0 = performance.now();
+  for (let i = 0; i < 20; i++) resolveGuess('Qwertyuiop asdfghjk');
+  ok('autocorrect is fast (under 40 ms per guess)', (performance.now() - t0) / 20 < 40);
   ok('answers: accents and punctuation normalise', norm('Pac-Man') === norm('pac man') && norm('Résumé') === 'resume');
   // Every puzzle answer resolves to a list entry
   let allMap = true;

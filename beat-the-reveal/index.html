@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Ny4YpQ09VSFfw+ZmL9iMEA538nQb7qq4OfpOFooMxog='; style-src 'sha256-scddC0x4qYz4vvgk8U/vidAoOtzXHk8iGCM9M5PUvuo='; img-src data:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-taRDG5sLq6pEo64lqkTsDo07q6vK9UUGOmqBD/BRL+8='; style-src 'sha256-scddC0x4qYz4vvgk8U/vidAoOtzXHk8iGCM9M5PUvuo='; img-src data:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#0b0221">
 <meta name="description" content="Beat the Reveal: a daily trivia game. Five clues, one guess. Lock in now, or pay for one more clue?">
@@ -695,6 +695,7 @@ const DATA = JSON.parse(document.getElementById('btr-data').textContent);
 const LAUNCH = DATA.launch;
 const BANK_N = DATA.puzzles.length;
 const BANK_HASH = DATA.hash16;
+const TRY_URL = 'https://ameetgames.github.io/beat-the-reveal/';   // where a shared result points people
 const PRACTICE_N = (DATA.practice || []).length;      // undated Extras
 const ARCHIVE_N = (DATA.archive || []).length;        // dated Calendar archive (runs right up to launch)
 const ARCH = DATA.archiveStart || LAUNCH;
@@ -940,7 +941,7 @@ function defaultDB() {
   try { coarse = matchMedia('(pointer: coarse)').matches; } catch (e) { /* ignore */ }
   return {
     v: 1,
-    settings: { theme: 'night', reduceMotion: false, highContrast: false, symbols: false, haptics: coarse, historyHint: true, timer: 'std', crt: true, sound: false },
+    settings: { theme: 'night', reduceMotion: false, highContrast: false, symbols: false, haptics: coarse, historyHint: true, timer: 'std', crt: true, sound: false, tryLink: true },
     days: {},
     practice: {},   // undated extra puzzles: { index: { o: outcome, p: points } }
     archive: {},    // dated Calendar archive puzzles: { index: { o: outcome, p: points } }
@@ -1716,7 +1717,12 @@ async function copyText(t) {
     return !!ok;
   } catch (e) { return false; }
 }
+/* Every share goes through here, so each one can end with a "Try it" line (Settings can turn it off). */
+function withTryLink(text) {
+  return DB.settings.tryLink === false ? text : text + '\n\nTry it: ' + TRY_URL;
+}
 async function doShare(text) {
+  text = withTryLink(text);
   let coarse = false;
   try { coarse = matchMedia('(pointer: coarse)').matches; } catch (e) { /* ignore */ }
   if (coarse && navigator.share) {
@@ -1787,7 +1793,8 @@ function replayFromRun(run) {
     timer: run.timer === 'rlx' ? 1 : run.timer === 'off' ? 2 : 0, auto: run.auto, dwell: run.dwell };
 }
 function replayLink(run) {
-  return location.href.split('#')[0] + '#w=' + encodeReplay(replayFromRun(run));
+  // Always the hosted copy, so the link opens for a friend even when you play from a file on your own computer.
+  return TRY_URL + '#w=' + encodeReplay(replayFromRun(run));
 }
 /* Playback schedule: each recorded dwell is clamped to 3 to 15 seconds. */
 function replaySchedule(r) {
@@ -2554,7 +2561,7 @@ function openInvite(run) {
     body: [
       h('p', { text: 'Send this link to a friend. They watch your run replay at your pace and decide when to lock in, racing the clock you faced. It has no answer in it, only numbers.' }),
       inp,
-      h('p', { class: 'about-small', text: 'Your friend needs this same version of the game. Opening the file from a different folder or device will not carry the link along.' }),
+      h('p', { class: 'about-small', text: 'The link opens the online copy of the game. If that copy is not the same version as yours, your friend will see a “different version” message instead of your run.' }),
     ],
     actions: [{ label: 'CLOSE', cls: 'ghost' }, { label: 'COPY LINK', close: false, onClick: async () => { if (await copyText(link)) toast('LINK COPIED!'); else { inp.focus(); inp.select(); } } }],
     focus: 'input',
@@ -2575,7 +2582,7 @@ function handleReplayHash() {
     return true;
   }
   if (r.error === 'newer') {
-    openModal({ title: 'NEW VERSION', cls: 'cyan', body: [h('p', { text: 'This replay is from a newer version of the game. Update your copy and try the link again.' })], actions: [{ label: "OPEN TODAY'S PUZZLE" }] });
+    openModal({ title: 'NEW VERSION', cls: 'cyan', body: [h('p', { text: 'This replay was made with a different version of the game than this one. Refresh the page, or update your copy, and try the link again. If it still fails, ask your friend to resend it once both of you have the latest version.' })], actions: [{ label: "OPEN TODAY'S PUZZLE" }] });
     return true;
   }
   const meta = DATA.puzzles[r.n];
@@ -2724,6 +2731,7 @@ function openSettings() {
   body.push(sw('Reduce motion', 'Swaps animations for static cues', 'reduceMotion'));
   body.push(sw('High contrast', 'Plain black and white, all effects off', 'highContrast'));
   body.push(sw('Symbols instead of colors', 'Share results as [-][~][✓] text', 'symbols'));
+  body.push(sw('“Try it” link when sharing', 'Adds a link so friends can play too', 'tryLink'));
   body.push(sw('8-bit sound', 'Chiptune beeps and bloops', 'sound', () => { renderTop(); if (DB.settings.sound) { Sfx.ensure(); Sfx.play('start'); } }));
   body.push(sw('Haptics', 'Little buzzes on supported phones', 'haptics', () => haptic(20)));
   body.push(sw('History hint', 'Shows your hit rate for each lock-in clue', 'historyHint'));
@@ -3188,6 +3196,14 @@ function runSelfTest() {
   ok('replay round trip', dec.n === 7 && dec.lock === 3 && dec.outcome === 1 && dec.dwell[1] === 19);
   const flipped = code.slice(0, 5) + (code[5] === 'A' ? 'B' : 'A') + code.slice(6);
   ok('T9: flipped character is rejected', decodeReplay(flipped).error === 'damaged');
+  ok('invite link points at the hosted copy and round-trips', (function () {
+    const run = new Run(4, 'daily');
+    run.begin(); run.finish('wrong', 'zz');
+    const link = replayLink(run);
+    const m = /^(https:\/\/ameetgames\.github\.io\/beat-the-reveal\/)#w=([A-Za-z0-9_-]{16})$/.exec(link);
+    const back = m && decodeReplay(m[2]);
+    return !!back && !back.error && back.n === 4;
+  })());
   ok('replay with another bank hash says newer', (function () {
     const saved = DATA.hash16;
     // re-encode with a different hash by flipping the hash bits and recomputing the CRC
@@ -3207,6 +3223,21 @@ function runSelfTest() {
     run.p.clues.forEach((cl) => { if (s.indexOf(cl.toLowerCase().slice(0, 20)) >= 0) leak = true; });
   }
   ok('T10: share text never leaks answers or clues', !leak);
+  // "Try it" link: on by default, ends the shared text, can be switched off, and still leaks nothing
+  {
+    const was = DB.settings.tryLink;
+    const run = new Run(0, 'practice');
+    run.begin(); run.finish('wrong', 'zz');
+    DB.settings.tryLink = true;
+    const withLink = withTryLink(shareText(run));
+    DB.settings.tryLink = false;
+    const without = withTryLink(shareText(run));
+    DB.settings.tryLink = was;
+    let linkLeak = false;
+    for (let n = 0; n < BANK_N; n++) if (TRY_URL.toLowerCase().indexOf(unseal(n).answer.display.toLowerCase()) >= 0) linkLeak = true;
+    ok('Try it: link is added by default and ends the shared text', TRY_URL === 'https://ameetgames.github.io/beat-the-reveal/' && /\nTry it: https:\/\/ameetgames\.github\.io\/beat-the-reveal\/$/.test(withLink));
+    ok('Try it: the Settings switch removes it, and the link names no answer', without.indexOf('Try it') < 0 && without === shareText(run) && !linkLeak);
+  }
   // Answers
   ok('answers: gibberish is not in the closed list', exactEntry('zzqxj') === null);
   // Autocorrect: free typing, snapped to the closest known answer (never to "the right one" on purpose)

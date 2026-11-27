@@ -94,12 +94,14 @@ service cloud.firestore {
         && t.removedKeys().size() == 0
         && t.changedKeys().size() == 0
         && t.addedKeys().size() > 0
-        && t.addedKeys().hasOnly(['minislam', 'minisoccer'])
+        && t.addedKeys().hasOnly(['minislam', 'minisoccer', 'beatthereveal'])
         && (!t.addedKeys().hasAny(['minislam']) || n.tried.minislam == true)
         && (!t.addedKeys().hasAny(['minisoccer']) || n.tried.minisoccer == true)
+        && (!t.addedKeys().hasAny(['beatthereveal']) || n.tried.beatthereveal == true)
         && n.xp == o.xp
              + (t.addedKeys().hasAny(['minislam']) ? 50 : 0)
-             + (t.addedKeys().hasAny(['minisoccer']) ? 25 : 0);
+             + (t.addedKeys().hasAny(['minisoccer']) ? 25 : 0)
+             + (t.addedKeys().hasAny(['beatthereveal']) ? 250 : 0);
     }
   }
 }

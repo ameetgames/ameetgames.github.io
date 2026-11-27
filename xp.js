@@ -17,6 +17,7 @@ const STREAK_XP = [50, 100, 200, 400];            // day 1, 2, 3, 4+ of a streak
 const TRY_REWARDS = {
   minislam:   { name: 'MiniSlam',   xp: 50 },
   minisoccer: { name: 'MiniSoccer', xp: 25 },
+  beatthereveal: { name: 'Beat the Reveal', xp: 250 },
 };
 const LOCAL_KEY = 'ameetgames.xp.v1';
 const EMULATOR = location.hostname === 'localhost' && new URLSearchParams(location.search).has('emulator');
@@ -566,7 +567,7 @@ decorateCards();
     if (cloud) {
       // games tried before signing in on this browser count for the account too
       const triedHere = Object.keys(local.tried).filter(id => local.tried[id] && !cloud.tried[id]);
-      if (triedHere.length) await claimTry(triedHere);
+      for (const id of triedHere) await claimTry([id]);
     }
     if (first || cloud) checkStreak();
     first = false;
